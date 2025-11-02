@@ -33,15 +33,32 @@ const MemoryPlatform = () => {
   const [uploadingPDF, setUploadingPDF] = useState(false);
   const [uploadError, setUploadError] = useState(null);
   const [uploadSuccess, setUploadSuccess] = useState(null);
+  const [initializing, setInitializing] = useState(true);
   const fileInputRef = useRef(null);
 
   const canvasRef = useRef(null);
   const [graphInstance, setGraphInstance] = useState(null);
 
-  // Initialize with sample data
+  // Initialize: Try loading from backend first, fall back to sample data if backend unavailable
   useEffect(() => {
-    loadSampleData();
-    loadStats();
+    const initializeData = async () => {
+      setInitializing(true);
+      try {
+        // Try to load real data from backend
+        await Promise.all([
+          loadGraphData(),
+          loadStats(),
+        ]);
+      } catch (error) {
+        console.warn("Backend unavailable, using sample data:", error);
+        // Fall back to sample data only if backend is unreachable
+        loadSampleData();
+        loadStatsFallback();
+      } finally {
+        setInitializing(false);
+      }
+    };
+    initializeData();
   }, []);
 
   // Auto-clear success/error messages after 5 seconds
@@ -124,7 +141,23 @@ const MemoryPlatform = () => {
     setMemories(sampleNodes);
   };
 
-  const loadStats = () => {
+  const loadStats = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/stats`);
+      if (response.ok) {
+        const data = await response.json();
+        setStats(data);
+      } else {
+        throw new Error(`Failed to load stats: ${response.statusText}`);
+      }
+    } catch (error) {
+      console.error("Failed to load stats from backend:", error);
+      throw error; // Re-throw to allow fallback in initialization
+    }
+  };
+
+  // Fallback stats for when backend is unavailable
+  const loadStatsFallback = () => {
     setStats({
       total_memories: 6,
       active_memories: 5,
@@ -139,36 +172,76 @@ const MemoryPlatform = () => {
     if (!newMemoryText.trim()) return;
 
     setLoading(true);
-    const newNode = {
-      id: String(memories.length + 1),
-      content: newMemoryText,
-      version: 1,
-      is_active: true,
-      created_at: new Date(),
-      metadata: { source: "user_input" },
-    };
+    try {
+      const response = await fetch(`${API_BASE}/memories`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text: newMemoryText,
+          metadata: { source: "user_input" },
+          source: "manual"
+        }),
+      });
 
-    setMemories([...memories, newNode]);
-    setGraphData((prev) => ({
-      ...prev,
-      nodes: [...prev.nodes, newNode],
-    }));
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to create memory' }));
+        throw new Error(errorData.detail || `Failed to create memory: ${response.statusText}`);
+      }
 
-    setNewMemoryText("");
-    setLoading(false);
-    loadStats();
+      // Reload graph and stats to reflect new memory and any inferred relationships
+      await loadGraphData();
+      await loadStats();
+
+      setNewMemoryText("");
+    } catch (error) {
+      console.error("Failed to create memory:", error);
+      // Show error to user (you might want to add error state here)
+      alert(error.message || "Failed to create memory. Please try again.");
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const performSearch = () => {
+  const performSearch = async () => {
     if (!searchQuery.trim()) {
       setSearchResults([]);
       return;
     }
 
-    const results = memories.filter((m) =>
-      m.content.toLowerCase().includes(searchQuery.toLowerCase())
-    );
-    setSearchResults(results);
+    try {
+      const response = await fetch(`${API_BASE}/search`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: searchQuery,
+          top_k: 10,
+          include_inactive: false,
+          relation_depth: 2
+        }),
+      });
+
+      if (response.ok) {
+        const results = await response.json();
+        setSearchResults(results);
+      } else {
+        // Fall back to local search if backend search fails
+        const results = memories.filter((m) =>
+          m.content.toLowerCase().includes(searchQuery.toLowerCase())
+        );
+        setSearchResults(results);
+      }
+    } catch (error) {
+      console.error("Search failed, using local search:", error);
+      // Fall back to local search if backend is unavailable
+      const results = memories.filter((m) =>
+        m.content.toLowerCase().includes(searchQuery.toLowerCase())
+      );
+      setSearchResults(results);
+    }
   };
 
   const handlePDFUpload = async (event) => {
@@ -203,12 +276,12 @@ const MemoryPlatform = () => {
       
       // Show success message
       setUploadSuccess(
-        `Successfully uploaded "${file.name}"! Created ${result.chunks_created} memory chunk(s).`
+        `Successfully uploaded "${file.name}"! Created ${result.chunks_created || 0} memory chunk(s).${result.chunks_skipped > 0 ? ` Skipped ${result.chunks_skipped} duplicate(s).` : ''}`
       );
 
       // Reload memories and graph data
       await loadGraphData();
-      loadStats();
+      await loadStats();
 
       // Clear file input
       if (fileInputRef.current) {
@@ -224,7 +297,7 @@ const MemoryPlatform = () => {
 
   const loadGraphData = async () => {
     try {
-      const response = await fetch(`${API_BASE}/graph`);
+      const response = await fetch(`${API_BASE}/graph?active_only=true`);
       if (response.ok) {
         const data = await response.json();
         setGraphData({
@@ -232,9 +305,12 @@ const MemoryPlatform = () => {
           edges: data.edges || [],
         });
         setMemories(data.nodes || []);
+      } else {
+        throw new Error(`Failed to load graph: ${response.statusText}`);
       }
     } catch (error) {
-      console.error("Failed to load graph data:", error);
+      console.error("Failed to load graph data from backend:", error);
+      throw error; // Re-throw to allow fallback in initialization
     }
   };
 
@@ -778,7 +854,14 @@ const MemoryPlatform = () => {
               </div>
 
               <div className="h-full">
-                {activeTab === "graph" ? (
+                {initializing ? (
+                  <div className="flex items-center justify-center h-full text-gray-400">
+                    <div className="text-center">
+                      <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
+                      <p>Loading graph data from backend...</p>
+                    </div>
+                  </div>
+                ) : activeTab === "graph" ? (
                   <GraphVisualization />
                 ) : (
                   <div className="p-6 overflow-y-auto h-full">
