@@ -6,7 +6,7 @@ Handles semantic memory ingestion, graph relationships, and vector search
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
 from datetime import datetime
 from enum import Enum
 import asyncio
@@ -16,6 +16,7 @@ import os
 import json
 import io
 import traceback
+from starlette.responses import StreamingResponse
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from neo4j import AsyncGraphDatabase
@@ -117,6 +118,68 @@ def handle_endpoint_error(exception: Exception, context: str = "operation") -> H
         traceback.print_exc()
     
     return HTTPException(status_code=status_code, detail=error_message)
+
+# ============= Real-Time Graph Updates =============
+
+class GraphUpdateNotifier:
+    """
+    Manages real-time notifications for knowledge graph changes.
+    Uses asyncio queues to broadcast updates to connected clients via SSE.
+    """
+    def __init__(self):
+        self.subscribers: Set[asyncio.Queue] = set()
+        self._lock = asyncio.Lock()
+    
+    async def subscribe(self) -> asyncio.Queue:
+        """Subscribe to graph updates. Returns a queue that will receive update events."""
+        queue = asyncio.Queue()
+        async with self._lock:
+            self.subscribers.add(queue)
+        print(f"📡 Graph update subscriber connected. Total subscribers: {len(self.subscribers)}")
+        return queue
+    
+    async def unsubscribe(self, queue: asyncio.Queue):
+        """Unsubscribe from graph updates."""
+        async with self._lock:
+            self.subscribers.discard(queue)
+        print(f"📡 Graph update subscriber disconnected. Total subscribers: {len(self.subscribers)}")
+    
+    async def notify_update(self, event_type: str, data: Dict[str, Any]):
+        """
+        Broadcast a graph update to all subscribers.
+        
+        Args:
+            event_type: Type of event (e.g., 'memory_created', 'memory_updated', 'relationship_added', 'graph_updated')
+            data: Event data payload
+        """
+        event = {
+            "type": event_type,
+            "timestamp": datetime.utcnow().isoformat(),
+            "data": data
+        }
+        
+        # Send to all subscribers (non-blocking)
+        async with self._lock:
+            dead_queues = set()
+            for queue in self.subscribers:
+                try:
+                    queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    # Queue full, mark for removal
+                    dead_queues.add(queue)
+                except Exception as e:
+                    # Queue error, mark for removal
+                    print(f"⚠️  Error sending update to subscriber: {e}")
+                    dead_queues.add(queue)
+            
+            # Clean up dead queues
+            self.subscribers -= dead_queues
+        
+        if len(self.subscribers) > 0:
+            print(f"📢 Broadcasted {event_type} to {len(self.subscribers)} subscriber(s)")
+
+# Global notifier instance
+graph_notifier = GraphUpdateNotifier()
 
 app = FastAPI(title="AI Memory Platform", version="1.0.0")
 
@@ -971,6 +1034,29 @@ async def create_memory(input_data: MemoryInput):
         for rel in relationships:
             await memory_store.add_relationship(rel)
         
+        # Notify subscribers of graph update
+        await graph_notifier.notify_update(
+            "memory_created",
+            {
+                "memory_id": memory.id,
+                "content_preview": memory.content[:100] + "..." if len(memory.content) > 100 else memory.content,
+                "relationships_count": len(relationships),
+                "source": input_data.source,
+                "metadata": memory.metadata
+            }
+        )
+        
+        # If relationships were created, notify those too
+        if relationships:
+            await graph_notifier.notify_update(
+                "relationships_added",
+                {
+                    "count": len(relationships),
+                    "memory_id": memory.id,
+                    "relationship_types": [rel.relation_type.value for rel in relationships]
+                }
+            )
+        
         return memory
     
     except HTTPException:
@@ -1100,6 +1186,32 @@ async def create_memory_from_pdf(file: UploadFile = File(...)):
             relationships = await processor.infer_relationships(memory, existing_memories)
             for rel in relationships:
                 await memory_store.add_relationship(rel)
+            
+            # Notify subscribers for each memory created from PDF
+            await graph_notifier.notify_update(
+                "memory_created",
+                {
+                    "memory_id": memory.id,
+                    "content_preview": memory.content[:100] + "..." if len(memory.content) > 100 else memory.content,
+                    "relationships_count": len(relationships),
+                    "source": "pdf",
+                    "filename": file.filename,
+                    "metadata": memory.metadata
+                }
+            )
+        
+        # Notify of bulk PDF processing completion
+        if created_memories:
+            await graph_notifier.notify_update(
+                "graph_updated",
+                {
+                    "event": "pdf_processed",
+                    "filename": file.filename,
+                    "chunks_created": len(created_memories),
+                    "chunks_skipped": len(skipped_duplicates),
+                    "memory_ids": [m.id for m in created_memories]
+                }
+            )
         
         # Return the first memory (or all if needed) - frontend can use this
         if not created_memories:
@@ -1237,6 +1349,53 @@ async def get_knowledge_graph(
         raise
     except Exception as e:
         raise handle_endpoint_error(e, context="get knowledge graph")
+
+@app.get("/api/graph/stream")
+async def stream_graph_updates():
+    """
+    Server-Sent Events (SSE) endpoint for real-time knowledge graph updates.
+    Streams graph change events as they occur (memory creation, updates, relationships, etc.).
+    
+    Frontend can connect to this endpoint to receive live updates:
+    ```javascript
+    const eventSource = new EventSource('/api/graph/stream');
+    eventSource.onmessage = (event) => {
+        const update = JSON.parse(event.data);
+        // Handle graph update
+    };
+    ```
+    """
+    async def event_generator():
+        queue = await graph_notifier.subscribe()
+        try:
+            # Send initial connection confirmation
+            yield f"data: {json.dumps({'type': 'connected', 'message': 'Graph update stream connected'})}\n\n"
+            
+            # Keep connection alive with periodic heartbeats
+            while True:
+                try:
+                    # Wait for event with timeout for heartbeat
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    # Format as SSE event
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    # Send heartbeat to keep connection alive
+                    yield f": heartbeat\n\n"
+        except asyncio.CancelledError:
+            # Client disconnected
+            pass
+        finally:
+            await graph_notifier.unsubscribe(queue)
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Disable nginx buffering
+        }
+    )
 
 @app.get("/api/stats")
 async def get_stats():
