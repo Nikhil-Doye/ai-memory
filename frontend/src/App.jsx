@@ -395,6 +395,353 @@ const MemoryPlatform = () => {
     }
   };
 
+  // Timeline View Component with Version Lineage
+  const TimelineView = ({ memories, relationships, onMemoryClick }) => {
+    // Build relationship maps for quick lookup
+    const updateChains = new Map(); // Maps from_id -> to_id for UPDATE relationships
+    const extendsMap = new Map(); // Maps from_id -> [to_ids] for EXTEND relationships
+    const derivesMap = new Map(); // Maps from_id -> [to_ids] for DERIVE relationships
+    const incomingUpdates = new Map(); // Maps to_id -> from_id (which memory updated this one)
+
+    relationships.forEach(edge => {
+      if (edge.relation_type === 'UPDATE') {
+        updateChains.set(edge.from_id, edge.to_id);
+        incomingUpdates.set(edge.to_id, edge.from_id);
+      } else if (edge.relation_type === 'EXTEND') {
+        if (!extendsMap.has(edge.from_id)) {
+          extendsMap.set(edge.from_id, []);
+        }
+        extendsMap.get(edge.from_id).push(edge.to_id);
+      } else if (edge.relation_type === 'DERIVE') {
+        if (!derivesMap.has(edge.from_id)) {
+          derivesMap.set(edge.from_id, []);
+        }
+        derivesMap.get(edge.from_id).push(edge.to_id);
+      }
+    });
+
+    // Sort memories by creation date
+    const sortedMemories = [...memories].sort(
+      (a, b) => new Date(a.created_at) - new Date(b.created_at)
+    );
+
+    // Group memories into version chains
+    const versionChains = new Map();
+    const processed = new Set();
+
+    sortedMemories.forEach(memory => {
+      if (processed.has(memory.id)) return;
+
+      // Find the root of this version chain (oldest memory that was updated)
+      let root = memory;
+      let current = memory;
+      
+      // Traverse backwards through UPDATE chain
+      while (incomingUpdates.has(current.id)) {
+        const prevId = incomingUpdates.get(current.id);
+        const prevMemory = memories.find(m => m.id === prevId);
+        if (prevMemory) {
+          root = prevMemory;
+          current = prevMemory;
+        } else {
+          break;
+        }
+      }
+
+      // Build the chain from root forward
+      const chain = [];
+      current = root;
+      while (current) {
+        if (processed.has(current.id)) break;
+        chain.push(current);
+        processed.add(current.id);
+        
+        // Find next in chain
+        const nextId = updateChains.get(current.id);
+        if (nextId) {
+          current = memories.find(m => m.id === nextId);
+        } else {
+          current = null;
+        }
+      }
+
+      if (chain.length > 0) {
+        versionChains.set(root.id, chain);
+      }
+    });
+
+    // Get standalone memories (no UPDATE relationships)
+    const standaloneMemories = sortedMemories.filter(m => 
+      !incomingUpdates.has(m.id) && !updateChains.has(m.id)
+    );
+
+    return (
+      <div className="space-y-6">
+        {/* Version Chains */}
+        {Array.from(versionChains.values()).map((chain, chainIdx) => (
+          <div key={`chain-${chainIdx}`} className="relative">
+            <div className="border-l-2 border-blue-600/50 pl-4 ml-2">
+              <div className="mb-2">
+                <span className="text-xs text-blue-400 font-medium">
+                  Version Chain {chainIdx + 1}
+                </span>
+                <span className="text-xs text-gray-500 ml-2">
+                  ({chain.length} version{chain.length !== 1 ? 's' : ''})
+                </span>
+              </div>
+              <div className="space-y-3">
+                {chain.map((memory, idx) => {
+                  const isSuperseded = idx < chain.length - 1;
+                  const wasUpdatedBy = idx > 0 ? chain[idx - 1] : null;
+                  const updatesNext = idx < chain.length - 1 ? chain[idx + 1] : null;
+                  const extendsList = extendsMap.get(memory.id) || [];
+                  const derivesList = derivesMap.get(memory.id) || [];
+
+                  return (
+                    <div key={memory.id} className="relative">
+                      {/* Connection line to next version */}
+                      {updatesNext && (
+                        <div className="absolute left-[-16px] top-[20px] w-[2px] h-[calc(100%+12px)] bg-red-500/50"></div>
+                      )}
+                      
+                      {/* Version indicator */}
+                      <div className="flex gap-3 items-start">
+                        <div className="flex flex-col items-center relative">
+                          {/* Arrow pointing to this version */}
+                          {wasUpdatedBy && (
+                            <div className="absolute left-[-8px] top-[-8px] text-red-500 text-xs">
+                              ↗
+                            </div>
+                          )}
+                          
+                          {/* Status dot */}
+                          <div
+                            className={`w-4 h-4 rounded-full border-2 ${
+                              memory.is_active
+                                ? "bg-green-500 border-green-400"
+                                : "bg-gray-500 border-gray-600"
+                            } ${isSuperseded ? "ring-2 ring-red-500/30" : ""}`}
+                            title={isSuperseded ? "Superseded by newer version" : memory.is_active ? "Active" : "Inactive"}
+                          ></div>
+                          
+                          {/* Line to next item */}
+                          {idx < chain.length - 1 && (
+                            <div className="w-0.5 h-[calc(100%+12px)] bg-red-500/30 my-1"></div>
+                          )}
+                        </div>
+
+                        {/* Memory content */}
+                        <div 
+                          className={`flex-1 pb-3 cursor-pointer hover:bg-slate-800/50 rounded p-2 transition-colors ${
+                            isSuperseded ? "opacity-60" : ""
+                          }`}
+                          onClick={() => onMemoryClick(memory)}
+                        >
+                          <div className="flex items-center gap-2 mb-1">
+                            <p className="text-xs text-gray-400">
+                              {new Date(memory.created_at).toLocaleString()}
+                            </p>
+                            {isSuperseded && (
+                              <span className="text-[10px] px-1.5 py-0.5 bg-red-900/30 text-red-400 rounded font-medium">
+                                SUPERSEDED
+                              </span>
+                            )}
+                            {memory.is_active && !isSuperseded && (
+                              <span className="text-[10px] px-1.5 py-0.5 bg-green-900/30 text-green-400 rounded font-medium">
+                                ACTIVE
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-sm text-gray-200 mt-1">
+                            {memory.content}
+                          </p>
+                          <div className="flex items-center gap-3 mt-2 text-xs text-gray-500">
+                            <span>v{memory.version}</span>
+                            {wasUpdatedBy && (
+                              <span className="text-red-400">
+                                ← Updated from v{wasUpdatedBy.version}
+                              </span>
+                            )}
+                            {updatesNext && (
+                              <span className="text-red-400">
+                                → Updated to v{updatesNext.version}
+                              </span>
+                            )}
+                          </div>
+
+                          {/* Related memories (EXTEND/DERIVE) */}
+                          {(extendsList.length > 0 || derivesList.length > 0) && (
+                            <div className="mt-2 pt-2 border-t border-slate-700">
+                              {extendsList.length > 0 && (
+                                <div className="mb-1">
+                                  <span className="text-[10px] text-blue-400">Extends:</span>
+                                  <div className="flex flex-wrap gap-1 mt-0.5">
+                                    {extendsList.map(extendId => {
+                                      const extendMem = memories.find(m => m.id === extendId);
+                                      return extendMem ? (
+                                        <span
+                                          key={extendId}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            onMemoryClick(extendMem);
+                                          }}
+                                          className="text-[10px] px-1.5 py-0.5 bg-blue-900/30 text-blue-400 rounded cursor-pointer hover:bg-blue-900/50"
+                                        >
+                                          {extendMem.content.substring(0, 30)}...
+                                        </span>
+                                      ) : null;
+                                    })}
+                                  </div>
+                                </div>
+                              )}
+                              {derivesList.length > 0 && (
+                                <div>
+                                  <span className="text-[10px] text-purple-400">Derives:</span>
+                                  <div className="flex flex-wrap gap-1 mt-0.5">
+                                    {derivesList.map(deriveId => {
+                                      const deriveMem = memories.find(m => m.id === deriveId);
+                                      return deriveMem ? (
+                                        <span
+                                          key={deriveId}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            onMemoryClick(deriveMem);
+                                          }}
+                                          className="text-[10px] px-1.5 py-0.5 bg-purple-900/30 text-purple-400 rounded cursor-pointer hover:bg-purple-900/50"
+                                        >
+                                          {deriveMem.content.substring(0, 30)}...
+                                        </span>
+                                      ) : null;
+                                    })}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        ))}
+
+        {/* Standalone Memories (no version chains) */}
+        {standaloneMemories.length > 0 && (
+          <div className="relative">
+            <div className="border-l-2 border-slate-700 pl-4 ml-2">
+              <div className="mb-2">
+                <span className="text-xs text-gray-500 font-medium">
+                  Standalone Memories
+                </span>
+              </div>
+              <div className="space-y-3">
+                {standaloneMemories.map((memory, idx) => {
+                  const extendsList = extendsMap.get(memory.id) || [];
+                  const derivesList = derivesMap.get(memory.id) || [];
+
+                  return (
+                    <div key={memory.id} className="flex gap-3 items-start">
+                      <div className="flex flex-col items-center">
+                        <div
+                          className={`w-4 h-4 rounded-full border-2 ${
+                            memory.is_active
+                              ? "bg-green-500 border-green-400"
+                              : "bg-gray-500 border-gray-600"
+                          }`}
+                        ></div>
+                        {idx < standaloneMemories.length - 1 && (
+                          <div className="w-0.5 h-full bg-slate-700 my-1"></div>
+                        )}
+                      </div>
+                      <div 
+                        className="flex-1 pb-3 cursor-pointer hover:bg-slate-800/50 rounded p-2 transition-colors"
+                        onClick={() => onMemoryClick(memory)}
+                      >
+                        <p className="text-xs text-gray-400">
+                          {new Date(memory.created_at).toLocaleString()}
+                        </p>
+                        <p className="text-sm text-gray-200 mt-1">
+                          {memory.content}
+                        </p>
+                        <div className="flex items-center gap-3 mt-2 text-xs text-gray-500">
+                          <span>v{memory.version}</span>
+                          {memory.is_active ? (
+                            <span className="text-green-400">Active</span>
+                          ) : (
+                            <span className="text-gray-400">Inactive</span>
+                          )}
+                        </div>
+
+                        {/* Related memories */}
+                        {(extendsList.length > 0 || derivesList.length > 0) && (
+                          <div className="mt-2 pt-2 border-t border-slate-700">
+                            {extendsList.length > 0 && (
+                              <div className="mb-1">
+                                <span className="text-[10px] text-blue-400">Extends:</span>
+                                <div className="flex flex-wrap gap-1 mt-0.5">
+                                  {extendsList.map(extendId => {
+                                    const extendMem = memories.find(m => m.id === extendId);
+                                    return extendMem ? (
+                                      <span
+                                        key={extendId}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          onMemoryClick(extendMem);
+                                        }}
+                                        className="text-[10px] px-1.5 py-0.5 bg-blue-900/30 text-blue-400 rounded cursor-pointer hover:bg-blue-900/50"
+                                      >
+                                        {extendMem.content.substring(0, 30)}...
+                                      </span>
+                                    ) : null;
+                                  })}
+                                </div>
+                              </div>
+                            )}
+                            {derivesList.length > 0 && (
+                              <div>
+                                <span className="text-[10px] text-purple-400">Derives:</span>
+                                <div className="flex flex-wrap gap-1 mt-0.5">
+                                  {derivesList.map(deriveId => {
+                                    const deriveMem = memories.find(m => m.id === deriveId);
+                                    return deriveMem ? (
+                                      <span
+                                        key={deriveId}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          onMemoryClick(deriveMem);
+                                        }}
+                                        className="text-[10px] px-1.5 py-0.5 bg-purple-900/30 text-purple-400 rounded cursor-pointer hover:bg-purple-900/50"
+                                      >
+                                        {deriveMem.content.substring(0, 30)}...
+                                      </span>
+                                    ) : null;
+                                  })}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {sortedMemories.length === 0 && (
+          <div className="text-center py-8 text-gray-400 text-sm">
+            No memories to display in timeline
+          </div>
+        )}
+      </div>
+    );
+  };
+
   // Graph Visualization Component
   // NOTE: Current implementation uses custom SVG+React for small-medium graphs.
   // For advanced graphs (100+ nodes, complex interactions), consider migrating to:
@@ -1152,41 +1499,14 @@ const MemoryPlatform = () => {
                     <h4 className="text-sm font-semibold text-gray-400 mb-4">
                       Memory Evolution Timeline
                     </h4>
-                    <div className="space-y-4">
-                      {memories
-                        .sort(
-                          (a, b) =>
-                            new Date(a.created_at) - new Date(b.created_at)
-                        )
-                        .map((memory, idx) => (
-                          <div key={memory.id} className="flex gap-4">
-                            <div className="flex flex-col items-center">
-                              <div
-                                className={`w-3 h-3 rounded-full ${
-                                  memory.is_active
-                                    ? "bg-green-500"
-                                    : "bg-gray-500"
-                                }`}
-                              ></div>
-                              {idx < memories.length - 1 && (
-                                <div className="w-0.5 h-full bg-slate-700 my-1"></div>
-                              )}
-                            </div>
-                            <div className="flex-1 pb-4">
-                              <p className="text-xs text-gray-400">
-                                {new Date(memory.created_at).toLocaleString()}
-                              </p>
-                              <p className="text-sm text-gray-200 mt-1">
-                                {memory.content}
-                              </p>
-                              <p className="text-xs text-gray-500 mt-1">
-                                v{memory.version} •{" "}
-                                {memory.is_active ? "Active" : "Superseded"}
-                              </p>
-                            </div>
-                          </div>
-                        ))}
-                    </div>
+                    <TimelineView 
+                      memories={memories} 
+                      relationships={graphData.edges}
+                      onMemoryClick={(memory) => {
+                        setSelectedNode(memory);
+                        loadNodeRelationships(memory.id);
+                      }}
+                    />
                   </div>
                 )}
               </div>
