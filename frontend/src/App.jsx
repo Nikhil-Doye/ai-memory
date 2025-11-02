@@ -172,6 +172,9 @@ const MemoryPlatform = () => {
     if (!newMemoryText.trim()) return;
 
     setLoading(true);
+    setUploadError(null);
+    setUploadSuccess(null);
+    
     try {
       const response = await fetch(`${API_BASE}/memories`, {
         method: 'POST',
@@ -187,18 +190,46 @@ const MemoryPlatform = () => {
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({ detail: 'Failed to create memory' }));
+        
+        // Handle conflict (409) - duplicate memory
+        if (response.status === 409) {
+          setUploadError(
+            errorData.detail || "This memory already exists (exact or semantic duplicate)."
+          );
+          setNewMemoryText("");
+          setLoading(false);
+          return;
+        }
+        
+        // Handle other errors
         throw new Error(errorData.detail || `Failed to create memory: ${response.statusText}`);
       }
 
-      // Reload graph and stats to reflect new memory and any inferred relationships
-      await loadGraphData();
-      await loadStats();
-
+      // Get the created memory from API response
+      const createdMemory = await response.json();
+      
+      // Show success message
+      setUploadSuccess(`Memory created successfully!`);
+      
+      // Clear input
       setNewMemoryText("");
+      
+      // Reload graph and stats to reflect new memory and any inferred relationships
+      // This ensures we get the latest state including relationships inferred by the backend
+      await Promise.all([
+        loadGraphData(),
+        loadStats(),
+      ]);
+      
     } catch (error) {
       console.error("Failed to create memory:", error);
-      // Show error to user (you might want to add error state here)
-      alert(error.message || "Failed to create memory. Please try again.");
+      
+      // Handle network errors or other failures
+      if (error.name === 'TypeError' && error.message.includes('fetch')) {
+        setUploadError("Unable to connect to backend. Please check if the server is running.");
+      } else {
+        setUploadError(error.message || "Failed to create memory. Please try again.");
+      }
     } finally {
       setLoading(false);
     }
@@ -702,6 +733,18 @@ const MemoryPlatform = () => {
                 {loading ? "Processing..." : "Create Memory"}
               </button>
 
+              {/* Error/Success messages for memory creation */}
+              {uploadError && !uploadingPDF && (
+                <div className="mt-3 text-sm text-red-400 bg-red-900/20 border border-red-800 rounded px-2 py-1">
+                  {uploadError}
+                </div>
+              )}
+              {uploadSuccess && !uploadingPDF && (
+                <div className="mt-3 text-sm text-green-400 bg-green-900/20 border border-green-800 rounded px-2 py-1">
+                  {uploadSuccess}
+                </div>
+              )}
+
               <div className="mt-3 pt-3 border-t border-slate-800">
                 <label className="flex items-center gap-2 text-sm text-gray-400 cursor-pointer hover:text-gray-300">
                   <Upload className="w-4 h-4" />
@@ -715,12 +758,13 @@ const MemoryPlatform = () => {
                     disabled={uploadingPDF}
                   />
                 </label>
-                {uploadError && (
+                {/* Error/Success messages for PDF upload only */}
+                {uploadError && uploadingPDF !== undefined && (
                   <div className="mt-2 text-sm text-red-400 bg-red-900/20 border border-red-800 rounded px-2 py-1">
                     {uploadError}
                   </div>
                 )}
-                {uploadSuccess && (
+                {uploadSuccess && uploadingPDF !== undefined && (
                   <div className="mt-2 text-sm text-green-400 bg-green-900/20 border border-green-800 rounded px-2 py-1">
                     {uploadSuccess}
                   </div>
