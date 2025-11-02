@@ -142,16 +142,50 @@ class MemoryStore:
                     self.neo4j_uri,
                     auth=(self.neo4j_user, self.neo4j_password)
                 )
-                print("✅ Connected to Neo4j for graph + vector storage")
+                print(f"📡 Neo4j driver created (URI: {self.neo4j_uri})")
+                print("   Connection will be verified during startup...")
             except Exception as e:
-                print(f"⚠️  Warning: Failed to connect to Neo4j: {e}")
+                print(f"⚠️  Warning: Failed to create Neo4j driver: {e}")
                 print("⚠️  Falling back to in-memory storage")
                 self.use_neo4j = False
                 self.driver = None
     
+    async def verify_connection(self) -> bool:
+        """Verify that Neo4j connection actually works"""
+        if not self.driver:
+            return False
+        
+        try:
+            async with self.driver.session() as session:
+                result = await session.run("RETURN 1 as test")
+                await result.single()
+            print("✅ Neo4j connection verified successfully")
+            return True
+        except Exception as e:
+            print(f"⚠️  Warning: Neo4j connection verification failed: {e}")
+            print(f"   URI: {self.neo4j_uri}")
+            print("   Make sure Neo4j is running and accessible.")
+            print("   If using Docker, run: docker-compose up -d")
+            print("   Or start Neo4j manually and ensure it's listening on the configured port.")
+            return False
+    
     async def initialize(self):
         """Initialize vector index after startup"""
-        if self.use_neo4j:
+        if self.use_neo4j and self.driver:
+            # First verify the connection actually works
+            if not await self.verify_connection():
+                print("⚠️  Disabling Neo4j usage due to connection failure")
+                print("⚠️  Falling back to in-memory storage")
+                self.use_neo4j = False
+                if self.driver:
+                    try:
+                        await self.driver.close()
+                    except Exception:
+                        pass
+                    self.driver = None
+                return
+            
+            # Connection verified, now initialize vector index
             await self._initialize_vector_index()
     
     async def _initialize_vector_index(self):
@@ -177,9 +211,16 @@ class MemoryStore:
                 await session.run(query, dimensions=embedding_dim)
                 print(f"✅ Vector index initialized (dimension: {embedding_dim})")
         except Exception as e:
-            print(f"⚠️  Warning: Could not create vector index: {e}")
+            error_msg = str(e)
+            print(f"⚠️  Warning: Could not create vector index: {error_msg}")
             print("⚠️  Vector search may not work. Ensure Neo4j 5.x+ with vector support.")
-            print(f"⚠️  Error details: {str(e)}")
+            
+            # Provide more specific guidance based on error type
+            if "Connection" in error_msg or "connect" in error_msg.lower():
+                print("   Connection error - verify Neo4j is running and accessible.")
+            elif "vector" in error_msg.lower() or "index" in error_msg.lower():
+                print("   Vector index error - ensure Neo4j version 5.x or higher with vector support.")
+                print("   Neo4j 5.11+ includes native vector search capabilities.")
     
     async def add_memory(self, memory: Memory) -> Memory:
         """Add memory to Neo4j or in-memory store"""
