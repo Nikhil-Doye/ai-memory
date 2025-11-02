@@ -318,7 +318,42 @@ class StatsCache:
 # Global stats cache instance
 stats_cache = StatsCache()
 
-app = FastAPI(title="AI Memory Platform", version="1.0.0")
+app = FastAPI(
+    title="AI Memory Platform API",
+    description="""
+    A semantic memory management system API that uses graph databases and vector embeddings 
+    to store, retrieve, and visualize knowledge relationships.
+    
+    ## Features
+    
+    - **Semantic Memory Storage**: Store and retrieve memories with vector embeddings
+    - **Knowledge Graph**: Visualize relationships between memories
+    - **Intelligent Relationships**: Automatically infer UPDATE, EXTEND, DERIVE, and CHUNK_SEQUENCE relationships
+    - **Vector Search**: Fast semantic search using Neo4j's native vector index
+    - **PDF Processing**: Extract and process text from PDF documents
+    - **Real-time Updates**: Server-Sent Events (SSE) for live graph updates
+    - **Performance Optimized**: Batch queries and Redis caching for sub-400ms latency
+    
+    ## Authentication
+    
+    Currently no authentication required. For production, implement API key or OAuth2.
+    
+    ## Rate Limiting
+    
+    No rate limiting currently implemented. Consider adding for production deployments.
+    """,
+    version="1.0.0",
+    contact={
+        "name": "API Support",
+        "email": "support@example.com",  # Update with actual contact
+    },
+    license_info={
+        "name": "MIT",  # Update with actual license
+    },
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
+)
 
 # CORS for frontend access
 # Read allowed origins from environment variable, with safe defaults for development
