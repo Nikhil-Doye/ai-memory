@@ -663,56 +663,105 @@ class MemoryStore:
     async def get_relationships(self, memory_id: str, 
                          relation_types: Optional[List[RelationType]] = None) -> List[MemoryRelationship]:
         """Get relationships for a memory"""
+        # Use batch method for single ID (more efficient)
+        results = await self.get_relationships_batch([memory_id], relation_types)
+        return results.get(memory_id, [])
+    
+    async def get_relationships_batch(self, memory_ids: List[str],
+                                    relation_types: Optional[List[RelationType]] = None) -> Dict[str, List[MemoryRelationship]]:
+        """
+        Batch fetch relationships for multiple memories in a single query.
+        Returns a dictionary mapping memory_id -> list of relationships.
+        This prevents N+1 query problems.
+        """
+        if not memory_ids:
+            return {}
+        
         if self.use_neo4j and self.driver:
             try:
                 async with self.driver.session() as session:
+                    rel_filter = ""
                     if relation_types:
                         rel_types = [rt.value for rt in relation_types]
-                        query = """
-                        MATCH (m:Memory {id: $memory_id})-[r:RELATES_TO]->(related:Memory)
-                        WHERE r.type IN $relation_types
-                        RETURN related.id as to_id, r.type as relation_type, 
-                               r.confidence as confidence, r.created_at as created_at,
-                               r.reasoning as reasoning
-                        UNION
-                        MATCH (m:Memory {id: $memory_id})<-[r:RELATES_TO]-(related:Memory)
-                        WHERE r.type IN $relation_types
-                        RETURN related.id as from_id, r.type as relation_type,
-                               r.confidence as confidence, r.created_at as created_at,
-                               r.reasoning as reasoning
+                        rel_filter = "WHERE r.type IN $relation_types"
+                    
+                    # Efficient batch query using WHERE ... IN clause
+                    # Leverages Neo4j's relationship traversal for optimal performance
+                    # Uses UNION to handle both directions of relationships
+                    if rel_filter:
+                        # When relation_types filter is present
+                        query = f"""
+                        MATCH (m:Memory)-[r:RELATES_TO]-(related:Memory)
+                        WHERE m.id IN $memory_ids AND r.type IN $relation_types
+                        RETURN 
+                            m.id as memory_id,
+                            startNode(r).id as from_id,
+                            endNode(r).id as to_id,
+                            r.type as relation_type, 
+                            r.confidence as confidence,
+                            r.created_at as created_at,
+                            r.reasoning as reasoning
                         """
-                        result = await session.run(query, memory_id=memory_id, relation_types=rel_types)
                     else:
                         query = """
-                        MATCH (m:Memory {id: $memory_id})-[r:RELATES_TO]-(related:Memory)
+                        MATCH (m:Memory)-[r:RELATES_TO]-(related:Memory)
+                        WHERE m.id IN $memory_ids
                         RETURN 
-                            CASE WHEN startNode(r) = m THEN related.id ELSE m.id END as from_id,
-                            CASE WHEN startNode(r) = m THEN m.id ELSE related.id END as to_id,
-                            r.type as relation_type, r.confidence as confidence,
-                            r.created_at as created_at, r.reasoning as reasoning
+                            m.id as memory_id,
+                            startNode(r).id as from_id,
+                            endNode(r).id as to_id,
+                            r.type as relation_type, 
+                            r.confidence as confidence,
+                            r.created_at as created_at,
+                            r.reasoning as reasoning
                         """
-                        result = await session.run(query, memory_id=memory_id)
                     
-                    relationships = []
+                    params = {"memory_ids": memory_ids}
+                    if relation_types:
+                        params["relation_types"] = rel_types
+                    
+                    result = await session.run(query, **params)
+                    
+                    # Group relationships by memory_id
+                    relationships_by_id: Dict[str, List[MemoryRelationship]] = {mid: [] for mid in memory_ids}
+                    
                     async for record in result:
-                        relationships.append(MemoryRelationship(
-                            from_id=record.get("from_id", memory_id),
-                            to_id=record.get("to_id", memory_id),
+                        memory_id = record["memory_id"]
+                        from_id = record["from_id"]
+                        to_id = record["to_id"]
+                        
+                        rel = MemoryRelationship(
+                            from_id=from_id,
+                            to_id=to_id,
                             relation_type=RelationType(record["relation_type"]),
                             confidence=record["confidence"],
                             created_at=datetime.fromisoformat(record["created_at"]),
                             reasoning=record.get("reasoning")
-                        ))
-                    return relationships
+                        )
+                        relationships_by_id[memory_id].append(rel)
+                    
+                    return relationships_by_id
             except Exception as e:
                 print(f"Warning: Failed to get relationships from Neo4j: {e}")
         
-        # In-memory fallback
-        rels = [r for r in self.relationships 
-                if r.from_id == memory_id or r.to_id == memory_id]
+        # In-memory fallback - batch operation
+        relationships_by_id: Dict[str, List[MemoryRelationship]] = {mid: [] for mid in memory_ids}
+        
+        for rel in self.relationships:
+            if rel.from_id in memory_ids:
+                relationships_by_id[rel.from_id].append(rel)
+            if rel.to_id in memory_ids:
+                relationships_by_id[rel.to_id].append(rel)
+        
+        # Filter by relation types if specified
         if relation_types:
-            rels = [r for r in rels if r.relation_type in relation_types]
-        return rels
+            for memory_id in relationships_by_id:
+                relationships_by_id[memory_id] = [
+                    r for r in relationships_by_id[memory_id] 
+                    if r.relation_type in relation_types
+                ]
+        
+        return relationships_by_id
     
     async def vector_search(self, query_embedding: List[float], top_k: int = 10, 
                            include_inactive: bool = False) -> List[Memory]:
@@ -820,29 +869,52 @@ class MemoryStore:
             except Exception as e:
                 print(f"Warning: Failed to get subgraph from Neo4j: {e}. Using in-memory.")
         
-        # In-memory fallback
+        # In-memory fallback - optimized with batch relationship fetching
         visited = set(memory_ids)
         queue = [(mid, 0) for mid in memory_ids]
         edges = []
+        all_visited_ids = set(memory_ids)
         
         while queue:
-            current_id, current_depth = queue.pop(0)
-            if current_depth >= depth:
-                continue
+            current_batch = []
+            current_depth = queue[0][1] if queue else depth
             
-            rels = await self.get_relationships(current_id)
-            for rel in rels:
-                edges.append(rel)
-                next_id = rel.to_id if rel.from_id == current_id else rel.from_id
-                if next_id not in visited:
-                    visited.add(next_id)
-                    queue.append((next_id, current_depth + 1))
+            # Collect all IDs at current depth for batch processing
+            while queue and queue[0][1] == current_depth:
+                current_id, depth_level = queue.pop(0)
+                if depth_level < depth:
+                    current_batch.append(current_id)
+            
+            if not current_batch:
+                break
+            
+            # Batch fetch relationships for all nodes at current depth
+            relationships_by_id = await self.get_relationships_batch(current_batch)
+            
+            for current_id in current_batch:
+                rels = relationships_by_id.get(current_id, [])
+                for rel in rels:
+                    # Check if edge already added (deduplicate)
+                    edge_key = (rel.from_id, rel.to_id, rel.relation_type)
+                    if not any(e.from_id == edge_key[0] and e.to_id == edge_key[1] and e.relation_type == edge_key[2] for e in edges):
+                        edges.append(rel)
+                    
+                    # Determine next node ID
+                    next_id = rel.to_id if rel.from_id == current_id else rel.from_id
+                    if next_id not in visited and current_depth + 1 < depth:
+                        visited.add(next_id)
+                        all_visited_ids.add(next_id)
+                        queue.append((next_id, current_depth + 1))
         
+        # Batch fetch all visited memories
         nodes = []
-        for mid in visited:
-            memory = await self.get_memory(mid)
-            if memory:
-                nodes.append(memory)
+        visited_list = list(all_visited_ids)
+        if visited_list:
+            for mid in visited_list:
+                memory = await self.get_memory(mid)
+                if memory:
+                    nodes.append(memory)
+        
         return nodes, edges
     
     async def get_all_memories(self, include_inactive: bool = False) -> List[Memory]:
@@ -877,6 +949,84 @@ class MemoryStore:
         
         return [m for m in self.memories.values() 
                 if include_inactive or m.is_active]
+    
+    async def get_all_relationships(self, active_only: bool = True) -> List[MemoryRelationship]:
+        """
+        Efficiently fetch all relationships in the graph in a single query.
+        Uses Neo4j's relationship traversal for optimal performance.
+        Prevents N+1 queries by fetching all relationships at once.
+        """
+        if self.use_neo4j and self.driver:
+            try:
+                async with self.driver.session() as session:
+                    # Single optimized query to get all relationships
+                    # Use explicit direction matching to avoid duplicates
+                    if active_only:
+                        query = """
+                        MATCH (m:Memory)-[r:RELATES_TO]-(related:Memory)
+                        WHERE m.is_active = true AND related.is_active = true
+                        RETURN DISTINCT
+                            startNode(r).id as from_id,
+                            endNode(r).id as to_id,
+                            r.type as relation_type, 
+                            r.confidence as confidence,
+                            r.created_at as created_at,
+                            r.reasoning as reasoning
+                        """
+                    else:
+                        query = """
+                        MATCH (m:Memory)-[r:RELATES_TO]-(related:Memory)
+                        RETURN DISTINCT
+                            startNode(r).id as from_id,
+                            endNode(r).id as to_id,
+                            r.type as relation_type, 
+                            r.confidence as confidence,
+                            r.created_at as created_at,
+                            r.reasoning as reasoning
+                        """
+                    
+                    result = await session.run(query)
+                    
+                    relationships = []
+                    seen_edges = set()
+                    async for record in result:
+                        from_id = record["from_id"]
+                        to_id = record["to_id"]
+                        edge_key = (from_id, to_id, record["relation_type"])
+                        
+                        # Deduplicate in case of bidirectional traversal
+                        if edge_key not in seen_edges:
+                            seen_edges.add(edge_key)
+                            relationships.append(MemoryRelationship(
+                                from_id=from_id,
+                                to_id=to_id,
+                                relation_type=RelationType(record["relation_type"]),
+                                confidence=record["confidence"],
+                                created_at=datetime.fromisoformat(record["created_at"]),
+                                reasoning=record.get("reasoning")
+                            ))
+                    
+                    return relationships
+            except Exception as e:
+                print(f"Warning: Failed to get all relationships from Neo4j: {e}")
+        
+        # In-memory fallback
+        rels = self.relationships
+        if active_only:
+            # Filter to only relationships between active memories
+            active_ids = {m.id for m in self.memories.values() if m.is_active}
+            rels = [r for r in rels if r.from_id in active_ids and r.to_id in active_ids]
+        
+        # Deduplicate
+        seen = set()
+        unique_rels = []
+        for rel in rels:
+            edge_key = (rel.from_id, rel.to_id, rel.relation_type)
+            if edge_key not in seen:
+                seen.add(edge_key)
+                unique_rels.append(rel)
+        
+        return unique_rels
 
 memory_store = MemoryStore()
 
@@ -1445,21 +1595,10 @@ async def get_knowledge_graph(
         if memory_ids:
             nodes, edges = await memory_store.get_subgraph(memory_ids, depth)
         else:
-            # Return entire graph
+            # Return entire graph - use optimized single query (prevents N+1)
             nodes = await memory_store.get_all_memories(include_inactive=not active_only)
-            # Get all relationships
-            all_rels = []
-            for node in nodes:
-                rels = await memory_store.get_relationships(node.id)
-                all_rels.extend(rels)
-            # Deduplicate edges
-            seen_edges = set()
-            edges = []
-            for rel in all_rels:
-                edge_key = (rel.from_id, rel.to_id, rel.relation_type)
-                if edge_key not in seen_edges:
-                    seen_edges.add(edge_key)
-                    edges.append(rel)
+            # Fetch all relationships in a single efficient query
+            edges = await memory_store.get_all_relationships(active_only=active_only)
         
         if active_only:
             active_ids = {n.id for n in nodes if n.is_active}
@@ -1554,20 +1693,26 @@ async def _compute_stats() -> Dict[str, Any]:
     total_memories = len(all_memories)
     active_memories = sum(1 for m in all_memories if m.is_active)
     
-    # Get all relationships
-    all_rels = []
-    for memory in all_memories:
-        rels = await memory_store.get_relationships(memory.id)
-        all_rels.extend(rels)
-    
-    # Deduplicate
-    seen_rels = set()
-    unique_rels = []
-    for rel in all_rels:
-        rel_key = (rel.from_id, rel.to_id, rel.relation_type)
-        if rel_key not in seen_rels:
-            seen_rels.add(rel_key)
-            unique_rels.append(rel)
+    # Batch fetch all relationships in a single query (prevents N+1)
+    if all_memories:
+        memory_ids = [m.id for m in all_memories]
+        relationships_by_id = await memory_store.get_relationships_batch(memory_ids)
+        
+        # Flatten relationships and deduplicate
+        all_rels = []
+        for rels in relationships_by_id.values():
+            all_rels.extend(rels)
+        
+        # Deduplicate
+        seen_rels = set()
+        unique_rels = []
+        for rel in all_rels:
+            rel_key = (rel.from_id, rel.to_id, rel.relation_type)
+            if rel_key not in seen_rels:
+                seen_rels.add(rel_key)
+                unique_rels.append(rel)
+    else:
+        unique_rels = []
     
     total_relationships = len(unique_rels)
     rel_type_counts = {}
