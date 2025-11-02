@@ -1621,7 +1621,7 @@ async def health_check():
     """Health check endpoint with system status"""
     health_status = {
         "status": "healthy",
-        "timestamp": datetime.utcnow(),
+        "timestamp": datetime.utcnow().isoformat(),
         "neo4j": False,
         "neo4j_vector": False,
         "embeddings": False
