@@ -23,6 +23,18 @@ from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError, TransientError
 import pdfplumber
 
+# Redis for caching (optional, with in-memory fallback)
+try:
+    import redis.asyncio as redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    try:
+        import redis
+        REDIS_AVAILABLE = True
+    except ImportError:
+        REDIS_AVAILABLE = False
+        print("⚠️  Redis not available. Stats caching will use in-memory fallback.")
+
 # Load environment variables from .env file
 # Check both backend/.env and root/.env
 env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -180,6 +192,131 @@ class GraphUpdateNotifier:
 
 # Global notifier instance
 graph_notifier = GraphUpdateNotifier()
+
+# ============= Stats Caching =============
+
+class StatsCache:
+    """
+    Caches platform statistics for fast retrieval.
+    Supports Redis (preferred) with in-memory fallback.
+    Automatically invalidates when data changes.
+    """
+    def __init__(self):
+        self.redis_client = None
+        self.use_redis = False
+        self.in_memory_cache: Optional[Dict[str, Any]] = None
+        self.cache_key = "platform:stats"
+        self._lock = asyncio.Lock()
+        
+        # Initialize Redis connection if available
+        if REDIS_AVAILABLE:
+            try:
+                redis_host = os.getenv("REDIS_HOST", "localhost")
+                redis_port = int(os.getenv("REDIS_PORT", "6379"))
+                redis_db = int(os.getenv("REDIS_DB", "0"))
+                
+                # Try async Redis
+                try:
+                    # redis.asyncio.Redis for async operations
+                    if hasattr(redis, 'Redis'):
+                        # Check if it's async redis module
+                        self.redis_client = redis.Redis(
+                            host=redis_host,
+                            port=redis_port,
+                            db=redis_db,
+                            decode_responses=True,
+                            socket_connect_timeout=2
+                        )
+                        # Test connection
+                        try:
+                            # Try a simple ping to verify connection works
+                            import asyncio
+                            # We'll do an async ping in get_stats if needed
+                            self.use_redis = True
+                            print(f"✅ Redis client initialized for stats caching ({redis_host}:{redis_port})")
+                        except Exception as e:
+                            print(f"⚠️  Could not connect to Redis: {e}. Using in-memory cache.")
+                            self.use_redis = False
+                    else:
+                        self.use_redis = False
+                except Exception as e:
+                    print(f"⚠️  Could not initialize Redis: {e}. Using in-memory cache.")
+                    self.use_redis = False
+            except Exception as e:
+                print(f"⚠️  Redis initialization failed: {e}. Using in-memory cache.")
+                self.use_redis = False
+    
+    async def get_stats(self) -> Optional[Dict[str, Any]]:
+        """Get cached stats if available"""
+        async with self._lock:
+            if self.use_redis and self.redis_client:
+                try:
+                    # Handle both async and sync Redis clients
+                    if hasattr(self.redis_client, 'get') and asyncio.iscoroutinefunction(self.redis_client.get):
+                        cached = await self.redis_client.get(self.cache_key)
+                    else:
+                        # Sync client - run in executor
+                        cached = await asyncio.to_thread(self.redis_client.get, self.cache_key)
+                    
+                    if cached:
+                        return json.loads(cached)
+                except Exception as e:
+                    print(f"⚠️  Redis get error: {e}. Falling back to in-memory.")
+                    self.use_redis = False
+            
+            # Fallback to in-memory cache
+            return self.in_memory_cache
+    
+    async def set_stats(self, stats: Dict[str, Any], ttl: int = 300):
+        """
+        Cache stats data with optional TTL (time-to-live in seconds).
+        Default TTL is 5 minutes (300s).
+        """
+        async with self._lock:
+            stats_json = json.dumps(stats)
+            
+            if self.use_redis and self.redis_client:
+                try:
+                    # Handle both async and sync Redis clients
+                    if hasattr(self.redis_client, 'setex') and asyncio.iscoroutinefunction(self.redis_client.setex):
+                        await self.redis_client.setex(self.cache_key, ttl, stats_json)
+                    else:
+                        # Sync client - run in executor
+                        await asyncio.to_thread(self.redis_client.setex, self.cache_key, ttl, stats_json)
+                    return
+                except Exception as e:
+                    print(f"⚠️  Redis set error: {e}. Falling back to in-memory.")
+                    self.use_redis = False
+            
+            # Fallback to in-memory cache (no TTL for in-memory)
+            self.in_memory_cache = stats
+    
+    async def invalidate(self):
+        """Invalidate cached stats (call when data changes)"""
+        async with self._lock:
+            if self.use_redis and self.redis_client:
+                try:
+                    # Handle both async and sync Redis clients
+                    if hasattr(self.redis_client, 'delete') and asyncio.iscoroutinefunction(self.redis_client.delete):
+                        await self.redis_client.delete(self.cache_key)
+                    else:
+                        # Sync client - run in executor
+                        await asyncio.to_thread(self.redis_client.delete, self.cache_key)
+                except Exception as e:
+                    print(f"⚠️  Redis delete error: {e}")
+            
+            self.in_memory_cache = None
+    
+    async def close(self):
+        """Close Redis connection"""
+        if self.redis_client:
+            try:
+                await self.redis_client.close()
+            except Exception:
+                pass
+
+# Global stats cache instance
+stats_cache = StatsCache()
 
 app = FastAPI(title="AI Memory Platform", version="1.0.0")
 
@@ -748,6 +885,11 @@ memory_store = MemoryStore()
 async def startup_event():
     await memory_store.initialize()
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up resources on shutdown"""
+    await stats_cache.close()
+
 # ============= Embedding Service =============
 
 class EmbeddingService:
@@ -1057,6 +1199,9 @@ async def create_memory(input_data: MemoryInput):
                 }
             )
         
+        # Invalidate stats cache since data has changed
+        await stats_cache.invalidate()
+        
         return memory
     
     except HTTPException:
@@ -1200,7 +1345,7 @@ async def create_memory_from_pdf(file: UploadFile = File(...)):
                 }
             )
         
-        # Notify of bulk PDF processing completion
+        # Notify of bulk PDF processing completion and invalidate cache
         if created_memories:
             await graph_notifier.notify_update(
                 "graph_updated",
@@ -1212,6 +1357,9 @@ async def create_memory_from_pdf(file: UploadFile = File(...)):
                     "memory_ids": [m.id for m in created_memories]
                 }
             )
+            
+            # Invalidate stats cache since data has changed
+            await stats_cache.invalidate()
         
         # Return the first memory (or all if needed) - frontend can use this
         if not created_memories:
@@ -1397,42 +1545,72 @@ async def stream_graph_updates():
         }
     )
 
+async def _compute_stats() -> Dict[str, Any]:
+    """
+    Compute platform statistics from database.
+    This is separated so it can be called to refresh cache.
+    """
+    all_memories = await memory_store.get_all_memories(include_inactive=True)
+    total_memories = len(all_memories)
+    active_memories = sum(1 for m in all_memories if m.is_active)
+    
+    # Get all relationships
+    all_rels = []
+    for memory in all_memories:
+        rels = await memory_store.get_relationships(memory.id)
+        all_rels.extend(rels)
+    
+    # Deduplicate
+    seen_rels = set()
+    unique_rels = []
+    for rel in all_rels:
+        rel_key = (rel.from_id, rel.to_id, rel.relation_type)
+        if rel_key not in seen_rels:
+            seen_rels.add(rel_key)
+            unique_rels.append(rel)
+    
+    total_relationships = len(unique_rels)
+    rel_type_counts = {}
+    for rel in unique_rels:
+        rel_type_counts[rel.relation_type.value] = rel_type_counts.get(rel.relation_type.value, 0) + 1
+    
+    stats = {
+        "total_memories": total_memories,
+        "active_memories": active_memories,
+        "inactive_memories": total_memories - active_memories,
+        "total_relationships": total_relationships,
+        "relationship_types": rel_type_counts,
+        "avg_relationships_per_memory": total_relationships / total_memories if total_memories > 0 else 0,
+        "cached_at": datetime.utcnow().isoformat()
+    }
+    
+    return stats
+
 @app.get("/api/stats")
 async def get_stats():
-    """Get platform statistics"""
+    """
+    Get platform statistics with caching for performance.
+    Returns cached stats if available, otherwise computes and caches them.
+    Cache is invalidated when memories or relationships change.
+    """
     try:
-        all_memories = await memory_store.get_all_memories(include_inactive=True)
-        total_memories = len(all_memories)
-        active_memories = sum(1 for m in all_memories if m.is_active)
+        # Try to get from cache first
+        cached_stats = await stats_cache.get_stats()
+        if cached_stats:
+            # Remove cached_at from response if present (internal metadata)
+            response_stats = {k: v for k, v in cached_stats.items() if k != "cached_at"}
+            return response_stats
         
-        # Get all relationships
-        all_rels = []
-        for memory in all_memories:
-            rels = await memory_store.get_relationships(memory.id)
-            all_rels.extend(rels)
+        # Cache miss - compute stats
+        stats = await _compute_stats()
         
-        # Deduplicate
-        seen_rels = set()
-        unique_rels = []
-        for rel in all_rels:
-            rel_key = (rel.from_id, rel.to_id, rel.relation_type)
-            if rel_key not in seen_rels:
-                seen_rels.add(rel_key)
-                unique_rels.append(rel)
+        # Cache the results (5 minute TTL)
+        await stats_cache.set_stats(stats, ttl=300)
         
-        total_relationships = len(unique_rels)
-        rel_type_counts = {}
-        for rel in unique_rels:
-            rel_type_counts[rel.relation_type.value] = rel_type_counts.get(rel.relation_type.value, 0) + 1
-        
-        return {
-            "total_memories": total_memories,
-            "active_memories": active_memories,
-            "inactive_memories": total_memories - active_memories,
-            "total_relationships": total_relationships,
-            "relationship_types": rel_type_counts,
-            "avg_relationships_per_memory": total_relationships / total_memories if total_memories > 0 else 0
-        }
+        # Remove cached_at from response
+        response_stats = {k: v for k, v in stats.items() if k != "cached_at"}
+        return response_stats
+    
     except HTTPException:
         raise
     except Exception as e:
