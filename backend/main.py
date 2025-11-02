@@ -5,7 +5,7 @@ Handles semantic memory ingestion, graph relationships, and vector search
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from enum import Enum
@@ -19,6 +19,7 @@ import traceback
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from neo4j import AsyncGraphDatabase
+from neo4j.exceptions import ServiceUnavailable, AuthError, TransientError
 import pdfplumber
 
 # Load environment variables from .env file
@@ -31,6 +32,91 @@ elif os.path.exists(root_env_path):
     load_dotenv(root_env_path)
 else:
     load_dotenv()  # Try default location
+
+# ============= Error Handling Utilities =============
+
+def classify_exception(exception: Exception) -> Tuple[int, str]:
+    """
+    Classify exceptions and return appropriate HTTP status code and message.
+    Returns (status_code, error_message) tuple.
+    """
+    error_type = type(exception).__name__
+    error_msg = str(exception)
+    
+    # Neo4j/Database errors
+    if isinstance(exception, (ServiceUnavailable,)):
+        return (503, f"Database service unavailable: {error_msg}. Please check if Neo4j is running.")
+    
+    if isinstance(exception, (AuthError,)):
+        return (401, f"Database authentication failed: {error_msg}. Check your Neo4j credentials.")
+    
+    if isinstance(exception, (TransientError,)):
+        return (503, f"Database transient error: {error_msg}. Please try again later.")
+    
+    # Validation errors
+    if isinstance(exception, ValidationError):
+        return (422, f"Validation error: {error_msg}")
+    
+    if isinstance(exception, ValueError):
+        # Check for specific value errors
+        if "NEO4J_PASSWORD" in error_msg:
+            return (500, error_msg)  # Already has good message
+        return (400, f"Invalid input: {error_msg}")
+    
+    if isinstance(exception, (TypeError, AttributeError)):
+        return (400, f"Invalid request format: {error_msg}")
+    
+    # File/Upload errors
+    if isinstance(exception, (FileNotFoundError, IOError, OSError)):
+        return (404, f"File operation failed: {error_msg}")
+    
+    # Embedding/Model errors (can be identified by error message patterns)
+    error_lower = error_msg.lower()
+    if "embedding" in error_lower or "model" in error_lower or "huggingface" in error_lower:
+        if "token" in error_lower or "auth" in error_lower or "401" in error_msg:
+            return (401, f"Model authentication failed: {error_msg}. Check your Hugging Face token.")
+        if "connection" in error_lower or "network" in error_lower:
+            return (503, f"Model service unavailable: {error_msg}. Check your internet connection.")
+        return (500, f"Embedding/model error: {error_msg}")
+    
+    # PDF processing errors
+    if "pdf" in error_lower or "pdfplumber" in error_lower:
+        if "corrupted" in error_lower or "invalid" in error_lower:
+            return (400, f"Invalid PDF file: {error_msg}")
+        return (422, f"PDF processing error: {error_msg}")
+    
+    # JSON/Serialization errors
+    if isinstance(exception, (json.JSONDecodeError, UnicodeDecodeError)):
+        return (400, f"Data format error: {error_msg}")
+    
+    # Timeout errors
+    if isinstance(exception, asyncio.TimeoutError) or "timeout" in error_lower:
+        return (504, f"Request timeout: {error_msg}")
+    
+    # Permission errors
+    if isinstance(exception, PermissionError):
+        return (403, f"Permission denied: {error_msg}")
+    
+    # Memory/Resource errors
+    if isinstance(exception, (MemoryError,)):
+        return (507, f"Insufficient resources: {error_msg}")
+    
+    # Default: Internal server error
+    return (500, f"Internal server error: {error_msg}")
+
+def handle_endpoint_error(exception: Exception, context: str = "operation") -> HTTPException:
+    """
+    Handle exceptions in endpoints by classifying them and returning appropriate HTTPException.
+    Provides better error messages and status codes for UI/UX.
+    """
+    status_code, error_message = classify_exception(exception)
+    
+    # Log full traceback for debugging (server-side only)
+    if status_code >= 500:
+        print(f"⚠️  Error in {context}: {type(exception).__name__}: {error_message}")
+        traceback.print_exc()
+    
+    return HTTPException(status_code=status_code, detail=error_message)
 
 app = FastAPI(title="AI Memory Platform", version="1.0.0")
 
@@ -891,7 +977,7 @@ async def create_memory(input_data: MemoryInput):
         # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise handle_endpoint_error(e, context="create memory")
 
 @app.post("/api/memories/pdf")
 async def create_memory_from_pdf(file: UploadFile = File(...)):
@@ -1037,15 +1123,7 @@ async def create_memory_from_pdf(file: UploadFile = File(...)):
         # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
-        # Log the full error for debugging
-        error_trace = traceback.format_exc()
-        print(f"PDF upload error: {str(e)}")
-        print(f"Traceback: {error_trace}")
-        
-        error_msg = str(e).lower()
-        if "syntax" in error_msg or "invalid" in error_msg or "corrupted" in error_msg:
-            raise HTTPException(status_code=400, detail=f"Invalid or corrupted PDF file: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+        raise handle_endpoint_error(e, context="PDF upload")
 
 @app.post("/api/search", response_model=List[Memory])
 async def search_memories(query: SearchQuery):
@@ -1063,25 +1141,38 @@ async def search_memories(query: SearchQuery):
         
         return results
     
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise handle_endpoint_error(e, context="search memories")
 
 @app.get("/api/memories/{memory_id}", response_model=Memory)
 async def get_memory(memory_id: str):
     """Retrieve a specific memory"""
-    memory = await memory_store.get_memory(memory_id)
-    if not memory:
-        raise HTTPException(status_code=404, detail="Memory not found")
-    return memory
+    try:
+        memory = await memory_store.get_memory(memory_id)
+        if not memory:
+            raise HTTPException(status_code=404, detail=f"Memory not found: {memory_id}")
+        return memory
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise handle_endpoint_error(e, context="get memory")
 
 @app.get("/api/memories/{memory_id}/relationships", response_model=List[MemoryRelationship])
 async def get_memory_relationships(memory_id: str):
     """Get all relationships for a memory"""
-    memory = await memory_store.get_memory(memory_id)
-    if not memory:
-        raise HTTPException(status_code=404, detail="Memory not found")
-    
-    return await memory_store.get_relationships(memory_id)
+    try:
+        memory = await memory_store.get_memory(memory_id)
+        if not memory:
+            raise HTTPException(status_code=404, detail=f"Memory not found: {memory_id}")
+        
+        relationships = await memory_store.get_relationships(memory_id)
+        return relationships
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise handle_endpoint_error(e, context="get memory relationships")
 
 @app.get("/api/graph", response_model=KnowledgeGraphResponse)
 async def get_knowledge_graph(
@@ -1142,44 +1233,51 @@ async def get_knowledge_graph(
             total_edges=len(graph_edges)
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise handle_endpoint_error(e, context="get knowledge graph")
 
 @app.get("/api/stats")
 async def get_stats():
     """Get platform statistics"""
-    all_memories = await memory_store.get_all_memories(include_inactive=True)
-    total_memories = len(all_memories)
-    active_memories = sum(1 for m in all_memories if m.is_active)
-    
-    # Get all relationships
-    all_rels = []
-    for memory in all_memories:
-        rels = await memory_store.get_relationships(memory.id)
-        all_rels.extend(rels)
-    
-    # Deduplicate
-    seen_rels = set()
-    unique_rels = []
-    for rel in all_rels:
-        rel_key = (rel.from_id, rel.to_id, rel.relation_type)
-        if rel_key not in seen_rels:
-            seen_rels.add(rel_key)
-            unique_rels.append(rel)
-    
-    total_relationships = len(unique_rels)
-    rel_type_counts = {}
-    for rel in unique_rels:
-        rel_type_counts[rel.relation_type.value] = rel_type_counts.get(rel.relation_type.value, 0) + 1
-    
-    return {
-        "total_memories": total_memories,
-        "active_memories": active_memories,
-        "inactive_memories": total_memories - active_memories,
-        "total_relationships": total_relationships,
-        "relationship_types": rel_type_counts,
-        "avg_relationships_per_memory": total_relationships / total_memories if total_memories > 0 else 0
-    }
+    try:
+        all_memories = await memory_store.get_all_memories(include_inactive=True)
+        total_memories = len(all_memories)
+        active_memories = sum(1 for m in all_memories if m.is_active)
+        
+        # Get all relationships
+        all_rels = []
+        for memory in all_memories:
+            rels = await memory_store.get_relationships(memory.id)
+            all_rels.extend(rels)
+        
+        # Deduplicate
+        seen_rels = set()
+        unique_rels = []
+        for rel in all_rels:
+            rel_key = (rel.from_id, rel.to_id, rel.relation_type)
+            if rel_key not in seen_rels:
+                seen_rels.add(rel_key)
+                unique_rels.append(rel)
+        
+        total_relationships = len(unique_rels)
+        rel_type_counts = {}
+        for rel in unique_rels:
+            rel_type_counts[rel.relation_type.value] = rel_type_counts.get(rel.relation_type.value, 0) + 1
+        
+        return {
+            "total_memories": total_memories,
+            "active_memories": active_memories,
+            "inactive_memories": total_memories - active_memories,
+            "total_relationships": total_relationships,
+            "relationship_types": rel_type_counts,
+            "avg_relationships_per_memory": total_relationships / total_memories if total_memories > 0 else 0
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise handle_endpoint_error(e, context="get stats")
 
 @app.get("/health")
 async def health_check():
