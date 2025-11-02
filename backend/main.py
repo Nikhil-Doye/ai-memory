@@ -65,6 +65,7 @@ class RelationType(str, Enum):
     UPDATE = "UPDATE"  # Supersedes previous information
     EXTEND = "EXTEND"  # Adds context, keeps original valid
     DERIVE = "DERIVE"  # Inferred insight from patterns
+    CHUNK_SEQUENCE = "CHUNK_SEQUENCE"  # Sequential chunks from the same document/source
 
 class MemoryInput(BaseModel):
     text: str = Field(..., description="Text content to memorize")
@@ -912,12 +913,12 @@ async def create_memory_from_pdf(file: UploadFile = File(...)):
                 # Link this chunk to the previous chunk from the same PDF
                 prev_memory = created_memories[chunk_idx - 1]
                 relationship = MemoryRelationship(
-                    id=str(uuid.uuid4()),
                     from_id=prev_memory.id,
                     to_id=memory.id,
-                    relation_type="related_to",
+                    relation_type=RelationType.CHUNK_SEQUENCE,
                     confidence=0.8,
-                    metadata={"reason": "Same PDF document", "pdf_source_id": pdf_source_id}
+                    created_at=datetime.utcnow(),
+                    reasoning=f"Sequential chunks from same PDF document (source: {pdf_source_id})"
                 )
                 await memory_store.add_relationship(relationship)
         
