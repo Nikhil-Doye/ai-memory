@@ -6,7 +6,7 @@ Handles semantic memory ingestion, graph relationships, and vector search
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from enum import Enum
 import asyncio
@@ -747,6 +747,44 @@ class MemoryProcessor:
         return memory
     
     @staticmethod
+    async def check_semantic_duplicates(content: str, similarity_threshold: float = 0.95) -> Optional[Tuple[Memory, float]]:
+        """
+        Check for semantic near-duplicates before memory creation using embedding similarity.
+        Returns (most_similar_memory, similarity_score) if found above threshold, None otherwise.
+        This prevents data bloat from reworded duplicates.
+        """
+        # Generate embedding for the new content
+        new_embedding = await embedding_service.generate_embedding(content, prompt_name="document")
+        
+        # Search for similar memories using vector search
+        # Check top 5 most similar to find potential duplicates
+        similar_memories = await memory_store.vector_search(
+            new_embedding,
+            top_k=5,
+            include_inactive=False
+        )
+        
+        # Calculate exact similarity scores for each candidate
+        best_match = None
+        best_similarity = 0.0
+        
+        for existing_memory in similar_memories:
+            similarity = embedding_service.cosine_similarity(
+                new_embedding, existing_memory.embedding
+            )
+            similarity = max(0.0, min(1.0, similarity))  # Clamp to valid range
+            
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match = existing_memory
+        
+        # Return match if similarity exceeds threshold
+        if best_match and best_similarity >= similarity_threshold:
+            return (best_match, best_similarity)
+        
+        return None
+    
+    @staticmethod
     async def infer_relationships(new_memory: Memory, 
                                   existing_memories: List[Memory]) -> List[MemoryRelationship]:
         """Infer relationships based on content similarity and patterns"""
@@ -802,20 +840,39 @@ processor = MemoryProcessor()
 async def create_memory(input_data: MemoryInput):
     """Create a new memory from text input"""
     try:
-        # Create memory object
+        # Check for exact hash duplicates first (fast check)
+        content_hash = MemoryProcessor.compute_content_hash(input_data.text)
+        similar_hashes = await memory_store.find_similar_by_hash(content_hash)
+        if similar_hashes:
+            existing_memory = await memory_store.get_memory(similar_hashes[0])
+            raise HTTPException(
+                status_code=409, 
+                detail=f"Exact duplicate memory already exists: {similar_hashes[0]}"
+            )
+        
+        # Check for semantic near-duplicates BEFORE creating memory
+        # This prevents reworded duplicates from creating data bloat
+        duplicate_check = await processor.check_semantic_duplicates(
+            input_data.text, 
+            similarity_threshold=0.95
+        )
+        if duplicate_check:
+            existing_memory, similarity = duplicate_check
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Semantic near-duplicate found (similarity: {similarity:.2%}). "
+                    f"Existing memory ID: {existing_memory.id}. "
+                    f"Content may be too similar to existing memory."
+                )
+            )
+        
+        # No duplicates found - create memory object
         memory = await processor.create_memory(
             input_data.text, 
             input_data.metadata,
             input_data.source
         )
-        
-        # Check for duplicates
-        similar_hashes = await memory_store.find_similar_by_hash(memory.content_hash)
-        if similar_hashes:
-            raise HTTPException(
-                status_code=409, 
-                detail=f"Similar memory already exists: {similar_hashes[0]}"
-            )
         
         # Store memory
         await memory_store.add_memory(memory)
@@ -830,6 +887,9 @@ async def create_memory(input_data: MemoryInput):
         
         return memory
     
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -889,9 +949,32 @@ async def create_memory_from_pdf(file: UploadFile = File(...)):
         
         # Create memories for each chunk
         created_memories = []
+        skipped_duplicates = []
         pdf_source_id = str(uuid.uuid4())  # Unique ID for this PDF upload
         
         for chunk_idx, chunk_text in enumerate(text_chunks):
+            # Check for exact hash duplicates (fast check)
+            chunk_hash = MemoryProcessor.compute_content_hash(chunk_text)
+            similar_hashes = await memory_store.find_similar_by_hash(chunk_hash)
+            if similar_hashes:
+                # Skip exact duplicate chunk
+                skipped_duplicates.append(f"Chunk {chunk_idx + 1}: exact duplicate")
+                continue
+            
+            # Check for semantic near-duplicates BEFORE creating memory
+            duplicate_check = await processor.check_semantic_duplicates(
+                chunk_text,
+                similarity_threshold=0.95
+            )
+            if duplicate_check:
+                # Skip semantic duplicate chunk
+                existing_memory, similarity = duplicate_check
+                skipped_duplicates.append(
+                    f"Chunk {chunk_idx + 1}: semantic duplicate (similarity: {similarity:.2%})"
+                )
+                continue
+            
+            # No duplicates found - create memory
             memory = await processor.create_memory(
                 chunk_text,
                 {
@@ -908,10 +991,10 @@ async def create_memory_from_pdf(file: UploadFile = File(...)):
             await memory_store.add_memory(memory)
             created_memories.append(memory)
             
-            # Create relationships between chunks from the same PDF
-            if chunk_idx > 0:
-                # Link this chunk to the previous chunk from the same PDF
-                prev_memory = created_memories[chunk_idx - 1]
+            # Create relationships between consecutive chunks from the same PDF
+            if len(created_memories) > 1:
+                # Link this chunk to the previous created chunk from the same PDF
+                prev_memory = created_memories[-2]  # Previous chunk in created_memories list
                 relationship = MemoryRelationship(
                     from_id=prev_memory.id,
                     to_id=memory.id,
@@ -933,13 +1016,21 @@ async def create_memory_from_pdf(file: UploadFile = File(...)):
                 await memory_store.add_relationship(rel)
         
         # Return the first memory (or all if needed) - frontend can use this
+        if not created_memories:
+            raise HTTPException(
+                status_code=400,
+                detail="All chunks from PDF were duplicates. No new memories created."
+            )
+        
         return {
             "id": pdf_source_id,
             "filename": file.filename,
             "chunks_created": len(created_memories),
+            "chunks_skipped": len(skipped_duplicates),
+            "skipped_details": skipped_duplicates if skipped_duplicates else None,
             "memories": [{"id": m.id, "content": m.content[:200] + "..." if len(m.content) > 200 else m.content} 
                         for m in created_memories],
-            "first_memory": created_memories[0]
+            "first_memory": created_memories[0] if created_memories else None
         }
     
     except HTTPException:
