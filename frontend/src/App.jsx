@@ -364,6 +364,12 @@ const MemoryPlatform = () => {
   };
 
   // Graph Visualization Component
+  // NOTE: Current implementation uses custom SVG+React for small-medium graphs.
+  // For advanced graphs (100+ nodes, complex interactions), consider migrating to:
+  // - D3.js with force simulation for physics-based layouts
+  // - vis.js Network for WebGL-accelerated rendering
+  // - cytoscape.js for comprehensive graph analysis features
+  // These libraries provide better performance, force-directed layouts, and pan/zoom.
   const GraphVisualization = () => {
     const svgRef = useRef(null);
     const [transform, setTransform] = useState({ x: 0, y: 0, scale: 1 });
@@ -403,16 +409,18 @@ const MemoryPlatform = () => {
         return;
       }
 
-      // Force-directed layout simulation
+      // Simple circular layout (suitable for small-medium graphs)
+      // TODO: For large graphs (100+ nodes), consider migrating to D3.js, vis.js, or cytoscape.js
+      // See frontend/GRAPH_VISUALIZATION_MIGRATION.md for migration guide
       const width = 800;
       const height = 600;
       const centerX = width / 2;
       const centerY = height / 2;
 
-      // Simple circular layout with physics
+      // Circular layout algorithm with adaptive radius
       const positions = graphData.nodes.map((node, i) => {
         const angle = (i / nodeCount) * 2 * Math.PI;
-        const radius = 200;
+        const radius = Math.min(200, Math.max(100, nodeCount * 5)); // Adaptive radius based on node count
         return {
           ...node,
           x: centerX + radius * Math.cos(angle),
