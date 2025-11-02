@@ -35,9 +35,25 @@ else:
 app = FastAPI(title="AI Memory Platform", version="1.0.0")
 
 # CORS for frontend access
+# Read allowed origins from environment variable, with safe defaults for development
+# Set CORS_ORIGINS environment variable to comma-separated list of allowed origins
+# Example: CORS_ORIGINS=http://localhost:5173,http://localhost:3000,https://yourdomain.com
+cors_origins_env = os.getenv("CORS_ORIGINS", "")
+if cors_origins_env:
+    # Split by comma and strip whitespace
+    allowed_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+else:
+    # Default to localhost development ports for safety
+    allowed_origins = [
+        "http://localhost:5173",  # Vite default port
+        "http://localhost:3000",   # Common React port
+        "http://127.0.0.1:5173",   # Alternative localhost
+        "http://127.0.0.1:3000",   # Alternative localhost
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
