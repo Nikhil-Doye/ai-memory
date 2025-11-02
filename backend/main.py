@@ -127,9 +127,23 @@ class MemoryStore:
         # Neo4j connection
         self.neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
         self.neo4j_user = os.getenv("NEO4J_USER", "neo4j")
-        self.neo4j_password = os.getenv("NEO4J_PASSWORD", "memoryplatform2024")
-        self.driver = None
         self.use_neo4j = os.getenv("USE_NEO4J", "false").lower() == "true"
+        
+        # Password must be provided via environment variable - never hardcode credentials
+        # Only require password if Neo4j is enabled
+        if self.use_neo4j:
+            self.neo4j_password = os.getenv("NEO4J_PASSWORD")
+            if not self.neo4j_password:
+                raise ValueError(
+                    "NEO4J_PASSWORD environment variable is required when USE_NEO4J=true. "
+                    "Please set NEO4J_PASSWORD in your .env file or environment variables. "
+                    "Never commit passwords to source code."
+                )
+        else:
+            # Not needed if Neo4j is disabled
+            self.neo4j_password = None
+        
+        self.driver = None
         
         # Fallback in-memory storage
         self.memories: Dict[str, Memory] = {}

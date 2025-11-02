@@ -89,7 +89,7 @@ Create a `.env` file in the root directory or `backend/` directory:
 # Neo4j Configuration
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=memoryplatform2024
+NEO4J_PASSWORD=your_neo4j_password_here  # REQUIRED when USE_NEO4J=true - set your actual password
 USE_NEO4J=true
 
 # Embedding Model Configuration
@@ -324,7 +324,7 @@ docker-compose up -d
 |----------|-------------|---------|
 | `NEO4J_URI` | Neo4j connection URI | `bolt://localhost:7687` |
 | `NEO4J_USER` | Neo4j username | `neo4j` |
-| `NEO4J_PASSWORD` | Neo4j password | `memoryplatform2024` |
+| `NEO4J_PASSWORD` | Neo4j password (REQUIRED when USE_NEO4J=true) | (none - must be set) |
 | `USE_NEO4J` | Enable Neo4j (false uses in-memory) | `false` |
 | `EMBEDDING_MODEL` | Hugging Face model name | `Qwen/Qwen3-Embedding-0.6B` |
 | `EMBEDDING_DIMENSION` | Embedding vector dimension | `768` |
