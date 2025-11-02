@@ -29,6 +29,8 @@ const MemoryPlatform = () => {
   const [newMemoryText, setNewMemoryText] = useState("");
   const [loading, setLoading] = useState(false);
   const [searchResults, setSearchResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState(null);
   const [activeTab, setActiveTab] = useState("graph");
   const [uploadingPDF, setUploadingPDF] = useState(false);
   const [uploadError, setUploadError] = useState(null);
@@ -238,8 +240,13 @@ const MemoryPlatform = () => {
   const performSearch = async () => {
     if (!searchQuery.trim()) {
       setSearchResults([]);
+      setSearchError(null);
       return;
     }
+
+    setSearching(true);
+    setSearchError(null);
+    setSearchResults([]);
 
     try {
       const response = await fetch(`${API_BASE}/search`, {
@@ -255,23 +262,34 @@ const MemoryPlatform = () => {
         }),
       });
 
-      if (response.ok) {
-        const results = await response.json();
-        setSearchResults(results);
-      } else {
-        // Fall back to local search if backend search fails
-        const results = memories.filter((m) =>
-          m.content.toLowerCase().includes(searchQuery.toLowerCase())
-        );
-        setSearchResults(results);
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ 
+          detail: `Search failed: ${response.statusText}` 
+        }));
+        throw new Error(errorData.detail || `Search failed: ${response.statusText}`);
       }
+
+      const results = await response.json();
+      
+      // Set results from backend semantic search
+      setSearchResults(results || []);
+      
+      // Clear any previous errors on success
+      setSearchError(null);
+      
     } catch (error) {
-      console.error("Search failed, using local search:", error);
-      // Fall back to local search if backend is unavailable
-      const results = memories.filter((m) =>
-        m.content.toLowerCase().includes(searchQuery.toLowerCase())
-      );
-      setSearchResults(results);
+      console.error("Semantic search failed:", error);
+      
+      // Show error to user - don't fall back to local search
+      // This ensures users know they're getting semantic search results
+      if (error.name === 'TypeError' && error.message.includes('fetch')) {
+        setSearchError("Unable to connect to backend for semantic search. Please check if the server is running.");
+      } else {
+        setSearchError(error.message || "Search failed. Please try again.");
+      }
+      setSearchResults([]);
+    } finally {
+      setSearching(false);
     }
   };
 
@@ -783,20 +801,47 @@ const MemoryPlatform = () => {
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  onKeyPress={(e) => e.key === "Enter" && performSearch()}
-                  placeholder="Search memories..."
-                  className="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+                  onKeyPress={(e) => e.key === "Enter" && !searching && performSearch()}
+                  placeholder="Search memories semantically..."
+                  disabled={searching}
+                  className="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
                 />
                 <button
                   onClick={performSearch}
-                  className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded transition-colors"
+                  disabled={searching || !searchQuery.trim()}
+                  className="bg-blue-600 hover:bg-blue-700 disabled:bg-slate-700 disabled:text-gray-500 disabled:cursor-not-allowed px-4 py-2 rounded transition-colors flex items-center justify-center"
                 >
-                  <Search className="w-4 h-4" />
+                  {searching ? (
+                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                  ) : (
+                    <Search className="w-4 h-4" />
+                  )}
                 </button>
               </div>
 
-              {searchResults.length > 0 && (
+              {/* Loading state */}
+              {searching && (
+                <div className="flex items-center justify-center py-4 text-gray-400">
+                  <div className="flex items-center gap-2">
+                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-500"></div>
+                    <span className="text-sm">Searching with semantic similarity...</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Error state */}
+              {searchError && !searching && (
+                <div className="mb-3 text-sm text-red-400 bg-red-900/20 border border-red-800 rounded px-2 py-1">
+                  {searchError}
+                </div>
+              )}
+
+              {/* Results */}
+              {!searching && searchResults.length > 0 && (
                 <div className="space-y-2">
+                  <div className="text-xs text-gray-400 mb-2">
+                    Found {searchResults.length} result{searchResults.length !== 1 ? 's' : ''} (semantic similarity)
+                  </div>
                   {searchResults.map((result) => (
                     <div
                       key={result.id}
@@ -804,14 +849,29 @@ const MemoryPlatform = () => {
                       className="bg-slate-800 border border-slate-700 rounded p-2 cursor-pointer hover:border-blue-500 transition-colors"
                     >
                       <p className="text-xs text-gray-300">
-                        {result.content.substring(0, 80)}...
+                        {result.content.substring(0, 100)}{result.content.length > 100 ? '...' : ''}
                       </p>
                       <p className="text-xs text-gray-500 mt-1">
                         v{result.version} •{" "}
                         {result.is_active ? "Active" : "Inactive"}
+                        {result.metadata?.source && ` • Source: ${result.metadata.source}`}
                       </p>
                     </div>
                   ))}
+                </div>
+              )}
+
+              {/* No results state */}
+              {!searching && !searchError && searchQuery.trim() && searchResults.length === 0 && (
+                <div className="text-center py-4 text-gray-400 text-sm">
+                  No memories found matching your query.
+                </div>
+              )}
+
+              {/* Empty state */}
+              {!searching && !searchError && !searchQuery.trim() && searchResults.length === 0 && (
+                <div className="text-center py-4 text-gray-500 text-xs">
+                  Enter a search query to find semantically similar memories.
                 </div>
               )}
             </div>
