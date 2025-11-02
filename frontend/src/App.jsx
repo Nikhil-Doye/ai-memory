@@ -24,6 +24,8 @@ const MemoryPlatform = () => {
   const [memories, setMemories] = useState([]);
   const [graphData, setGraphData] = useState({ nodes: [], edges: [] });
   const [selectedNode, setSelectedNode] = useState(null);
+  const [selectedNodeRelationships, setSelectedNodeRelationships] = useState([]);
+  const [loadingRelationships, setLoadingRelationships] = useState(false);
   const [stats, setStats] = useState({});
   const [searchQuery, setSearchQuery] = useState("");
   const [newMemoryText, setNewMemoryText] = useState("");
@@ -77,6 +79,36 @@ const MemoryPlatform = () => {
       return () => clearTimeout(timer);
     }
   }, [uploadError]);
+
+  const loadNodeRelationships = useCallback(async (memoryId) => {
+    if (!memoryId) return;
+    
+    setLoadingRelationships(true);
+    try {
+      const response = await fetch(`${API_BASE}/memories/${memoryId}/relationships`);
+      if (response.ok) {
+        const relationships = await response.json();
+        setSelectedNodeRelationships(relationships || []);
+      } else {
+        console.error("Failed to load relationships:", response.statusText);
+        setSelectedNodeRelationships([]);
+      }
+    } catch (error) {
+      console.error("Failed to load relationships:", error);
+      setSelectedNodeRelationships([]);
+    } finally {
+      setLoadingRelationships(false);
+    }
+  }, []);
+
+  // Load relationships when selected node changes
+  useEffect(() => {
+    if (selectedNode?.id) {
+      loadNodeRelationships(selectedNode.id);
+    } else {
+      setSelectedNodeRelationships([]);
+    }
+  }, [selectedNode?.id, loadNodeRelationships]);
 
   const loadSampleData = () => {
     const sampleNodes = [
@@ -584,7 +616,10 @@ const MemoryPlatform = () => {
               return (
                 <g
                   key={node.id}
-                  onClick={() => setSelectedNode(node)}
+                  onClick={() => {
+                    setSelectedNode(node);
+                    loadNodeRelationships(node.id);
+                  }}
                   style={{ cursor: "pointer" }}
                 >
                   <circle
@@ -853,7 +888,10 @@ const MemoryPlatform = () => {
                   {searchResults.map((result) => (
                     <div
                       key={result.id}
-                      onClick={() => setSelectedNode(result)}
+                      onClick={() => {
+                        setSelectedNode(result);
+                        loadNodeRelationships(result.id);
+                      }}
                       className="bg-slate-800 border border-slate-700 rounded p-2 cursor-pointer hover:border-blue-500 transition-colors"
                     >
                       <p className="text-xs text-gray-300">
@@ -886,7 +924,7 @@ const MemoryPlatform = () => {
 
             {/* Selected Node Details */}
             {selectedNode && (
-              <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
+              <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 max-h-[600px] overflow-y-auto">
                 <h3 className="text-lg font-semibold mb-3">Memory Details</h3>
                 <div className="space-y-3">
                   <div>
@@ -928,6 +966,140 @@ const MemoryPlatform = () => {
                       {selectedNode.metadata?.source || "Unknown"}
                     </p>
                   </div>
+                </div>
+
+                {/* Relationships Section */}
+                <div className="mt-4 pt-4 border-t border-slate-800">
+                  <div className="flex items-center justify-between mb-3">
+                    <h4 className="text-sm font-semibold text-gray-300">Connections</h4>
+                    {loadingRelationships && (
+                      <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-blue-500"></div>
+                    )}
+                  </div>
+
+                  {loadingRelationships ? (
+                    <div className="text-xs text-gray-400 text-center py-2">
+                      Loading relationships...
+                    </div>
+                  ) : selectedNodeRelationships.length === 0 ? (
+                    <div className="text-xs text-gray-400 text-center py-2">
+                      No relationships found
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {/* Incoming Relationships */}
+                      {selectedNodeRelationships
+                        .filter(rel => rel.to_id === selectedNode.id)
+                        .length > 0 && (
+                        <div>
+                          <p className="text-xs text-gray-500 mb-2 font-medium">Incoming:</p>
+                          <div className="space-y-1">
+                            {selectedNodeRelationships
+                              .filter(rel => rel.to_id === selectedNode.id)
+                              .map((rel) => {
+                                const relatedNode = graphData.nodes.find(n => n.id === rel.from_id);
+                                return (
+                                  <div
+                                    key={`in-${rel.from_id}-${rel.to_id}`}
+                                    onClick={() => {
+                                      if (relatedNode) {
+                                        setSelectedNode(relatedNode);
+                                        loadNodeRelationships(relatedNode.id);
+                                      }
+                                    }}
+                                    className="bg-slate-800 border border-slate-700 rounded p-2 cursor-pointer hover:border-blue-500 transition-colors text-xs"
+                                  >
+                                    <div className="flex items-center justify-between mb-1">
+                                      <span className="text-gray-400">← From:</span>
+                                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                                        rel.relation_type === 'UPDATE' ? 'bg-red-900/30 text-red-400' :
+                                        rel.relation_type === 'EXTEND' ? 'bg-blue-900/30 text-blue-400' :
+                                        rel.relation_type === 'DERIVE' ? 'bg-purple-900/30 text-purple-400' :
+                                        'bg-gray-900/30 text-gray-400'
+                                      }`}>
+                                        {rel.relation_type}
+                                      </span>
+                                    </div>
+                                    <p className="text-gray-300 text-[11px] truncate">
+                                      {relatedNode?.content.substring(0, 50) || rel.from_id}...
+                                    </p>
+                                    {rel.confidence && (
+                                      <p className="text-gray-500 text-[10px] mt-0.5">
+                                        Confidence: {(rel.confidence * 100).toFixed(0)}%
+                                      </p>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Outgoing Relationships */}
+                      {selectedNodeRelationships
+                        .filter(rel => rel.from_id === selectedNode.id)
+                        .length > 0 && (
+                        <div>
+                          <p className="text-xs text-gray-500 mb-2 font-medium mt-3">Outgoing:</p>
+                          <div className="space-y-1">
+                            {selectedNodeRelationships
+                              .filter(rel => rel.from_id === selectedNode.id)
+                              .map((rel) => {
+                                const relatedNode = graphData.nodes.find(n => n.id === rel.to_id);
+                                const isVersionHistory = rel.relation_type === 'UPDATE';
+                                return (
+                                  <div
+                                    key={`out-${rel.from_id}-${rel.to_id}`}
+                                    onClick={() => {
+                                      if (relatedNode) {
+                                        setSelectedNode(relatedNode);
+                                        loadNodeRelationships(relatedNode.id);
+                                      }
+                                    }}
+                                    className={`bg-slate-800 border rounded p-2 cursor-pointer hover:border-blue-500 transition-colors text-xs ${
+                                      isVersionHistory ? 'border-yellow-700/50 bg-yellow-900/10' : 'border-slate-700'
+                                    }`}
+                                  >
+                                    <div className="flex items-center justify-between mb-1">
+                                      <span className="text-gray-400">
+                                        {isVersionHistory ? '↗ Updated to:' : '→ To:'}
+                                      </span>
+                                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                                        rel.relation_type === 'UPDATE' ? 'bg-red-900/30 text-red-400' :
+                                        rel.relation_type === 'EXTEND' ? 'bg-blue-900/30 text-blue-400' :
+                                        rel.relation_type === 'DERIVE' ? 'bg-purple-900/30 text-purple-400' :
+                                        rel.relation_type === 'CHUNK_SEQUENCE' ? 'bg-green-900/30 text-green-400' :
+                                        'bg-gray-900/30 text-gray-400'
+                                      }`}>
+                                        {rel.relation_type}
+                                      </span>
+                                    </div>
+                                    <p className="text-gray-300 text-[11px] truncate">
+                                      {relatedNode?.content.substring(0, 50) || rel.to_id}...
+                                    </p>
+                                    {rel.confidence && (
+                                      <p className="text-gray-500 text-[10px] mt-0.5">
+                                        Confidence: {(rel.confidence * 100).toFixed(0)}%
+                                      </p>
+                                    )}
+                                    {rel.reasoning && (
+                                      <p className="text-gray-600 text-[10px] mt-0.5 italic">
+                                        {rel.reasoning.substring(0, 60)}...
+                                      </p>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Summary */}
+                      <div className="mt-3 pt-2 border-t border-slate-700 text-xs text-gray-500">
+                        {selectedNodeRelationships.length} total connection{selectedNodeRelationships.length !== 1 ? 's' : ''}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
