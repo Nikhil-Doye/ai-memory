@@ -16,6 +16,7 @@ import os
 import json
 import io
 import traceback
+import re
 from starlette.responses import StreamingResponse
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
@@ -230,7 +231,6 @@ class StatsCache:
                         # Test connection
                         try:
                             # Try a simple ping to verify connection works
-                            import asyncio
                             # We'll do an async ping in get_stats if needed
                             self.use_redis = True
                             print(f"✅ Redis client initialized for stats caching ({redis_host}:{redis_port})")
@@ -1261,6 +1261,120 @@ class MemoryProcessor:
         return None
     
     @staticmethod
+    async def semantic_chunk_text(text: str, 
+                                  min_chunk_size: int = 200,
+                                  max_chunk_size: int = 2000,
+                                  similarity_threshold: float = 0.7) -> List[str]:
+        """
+        Perform semantic chunking by detecting natural semantic boundaries.
+        
+        Algorithm:
+        1. Split text into sentences
+        2. Generate embeddings for each sentence
+        3. Detect semantic boundaries where similarity drops significantly
+        4. Create chunks at boundaries while respecting min/max size constraints
+        
+        Args:
+            text: Full text to chunk
+            min_chunk_size: Minimum characters per chunk
+            max_chunk_size: Maximum characters per chunk
+            similarity_threshold: Minimum similarity to keep sentences together (lower = more splits)
+        
+        Returns:
+            List of semantically coherent text chunks
+        """
+        # If text is small enough, return as single chunk
+        if len(text) <= max_chunk_size:
+            return [text.strip()] if text.strip() else []
+        
+        # Split into sentences (preserve sentence boundaries)
+        # This regex handles common sentence endings
+        sentence_pattern = r'(?<=[.!?])\s+'
+        sentences = re.split(sentence_pattern, text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        if len(sentences) <= 1:
+            # Fallback to paragraph-based if sentence splitting fails
+            paragraphs = text.split("\n\n")
+            current_chunk = ""
+            chunks = []
+            for para in paragraphs:
+                if len(current_chunk) + len(para) + 2 > max_chunk_size and current_chunk:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = para
+                else:
+                    current_chunk += "\n\n" + para if current_chunk else para
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            return chunks
+        
+        # Generate embeddings for all sentences (async)
+        sentence_embeddings = []
+        for sentence in sentences:
+            embedding = await embedding_service.generate_embedding(sentence, prompt_name="document")
+            sentence_embeddings.append(embedding)
+        
+        # Build chunks by detecting semantic boundaries
+        chunks = []
+        current_chunk = []
+        current_size = 0
+        
+        for i, sentence in enumerate(sentences):
+            sentence_size = len(sentence)
+            
+            # Check if adding this sentence would exceed max size
+            if current_size + sentence_size > max_chunk_size and current_chunk:
+                # Save current chunk
+                chunks.append(" ".join(current_chunk).strip())
+                current_chunk = [sentence]
+                current_size = sentence_size
+                continue
+            
+            # For sentences after the first in a chunk, check semantic similarity
+            if current_chunk:
+                # Compare with previous sentence in chunk
+                # Find the index of the previous sentence in the original list
+                prev_sentence_idx = i - 1
+                
+                if prev_sentence_idx >= 0 and prev_sentence_idx < len(sentence_embeddings):
+                    similarity = embedding_service.cosine_similarity(
+                        sentence_embeddings[prev_sentence_idx],
+                        sentence_embeddings[i]
+                    )
+                    
+                    # If similarity drops significantly, it's a semantic boundary
+                    if similarity < similarity_threshold and current_size >= min_chunk_size:
+                        # Save current chunk and start new one
+                        chunks.append(" ".join(current_chunk).strip())
+                        current_chunk = [sentence]
+                        current_size = sentence_size
+                        continue
+            
+            # Add sentence to current chunk
+            current_chunk.append(sentence)
+            current_size += sentence_size + 1  # +1 for space
+        
+        # Add final chunk
+        if current_chunk:
+            chunks.append(" ".join(current_chunk).strip())
+        
+        # Ensure all chunks meet minimum size (merge small chunks with neighbors)
+        final_chunks = []
+        i = 0
+        while i < len(chunks):
+            if len(chunks[i]) < min_chunk_size and i < len(chunks) - 1:
+                # Merge with next chunk if possible
+                merged = chunks[i] + " " + chunks[i + 1]
+                if len(merged) <= max_chunk_size:
+                    final_chunks.append(merged.strip())
+                    i += 2
+                    continue
+            final_chunks.append(chunks[i])
+            i += 1
+        
+        return final_chunks
+    
+    @staticmethod
     async def infer_relationships(new_memory: Memory, 
                                   existing_memories: List[Memory]) -> List[MemoryRelationship]:
         """Infer relationships based on content similarity and patterns"""
@@ -1408,7 +1522,6 @@ async def create_memory_from_pdf(file: UploadFile = File(...)):
         # Extract text from PDF using pdfplumber (run in thread pool to avoid blocking)
         def extract_pdf_text(pdf_bytes):
             """Extract text from PDF bytes - synchronous function"""
-            text_chunks = []
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 all_text = []
                 for page_num, page in enumerate(pdf.pages, 1):
@@ -1418,36 +1531,24 @@ async def create_memory_from_pdf(file: UploadFile = File(...)):
                 
                 # Combine all pages into full text
                 full_text = "\n\n".join(all_text)
-                
-                # Split into chunks if text is too long (max 2000 chars per chunk)
-                # This ensures we don't hit embedding model limits and allows better search granularity
-                max_chunk_size = 2000
-                if len(full_text) <= max_chunk_size:
-                    text_chunks = [full_text]
-                else:
-                    # Split by paragraphs/sentences, then by size
-                    paragraphs = full_text.split("\n\n")
-                    current_chunk = ""
-                    for para in paragraphs:
-                        # If adding this paragraph would exceed limit, save current chunk and start new one
-                        if len(current_chunk) + len(para) + 2 > max_chunk_size and current_chunk:
-                            text_chunks.append(current_chunk.strip())
-                            current_chunk = para
-                        else:
-                            if current_chunk:
-                                current_chunk += "\n\n" + para
-                            else:
-                                current_chunk = para
-                    # Add last chunk
-                    if current_chunk:
-                        text_chunks.append(current_chunk.strip())
-            return text_chunks
+                return full_text
         
         # Run PDF extraction in thread pool to avoid blocking
-        text_chunks = await asyncio.to_thread(extract_pdf_text, content)
+        full_text = await asyncio.to_thread(extract_pdf_text, content)
+        
+        if not full_text or not full_text.strip():
+            raise HTTPException(status_code=400, detail="No text could be extracted from PDF")
+        
+        # Perform semantic chunking
+        text_chunks = await processor.semantic_chunk_text(
+            full_text,
+            min_chunk_size=200,      # Minimum 200 chars per chunk
+            max_chunk_size=2000,     # Maximum 2000 chars per chunk
+            similarity_threshold=0.7  # Lower = more splits (0.5-0.8 range recommended)
+        )
         
         if not text_chunks:
-            raise HTTPException(status_code=400, detail="No text could be extracted from PDF")
+            raise HTTPException(status_code=400, detail="No text chunks could be created from PDF")
         
         # Create memories for each chunk
         created_memories = []

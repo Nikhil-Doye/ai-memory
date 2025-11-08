@@ -42,6 +42,18 @@ const MemoryPlatform = () => {
 
   const canvasRef = useRef(null);
   const [graphInstance, setGraphInstance] = useState(null);
+  
+  // Graph interaction state
+  const [hoveredNode, setHoveredNode] = useState(null);
+  const [filteredRelationTypes, setFilteredRelationTypes] = useState({
+    UPDATE: true,
+    EXTEND: true,
+    DERIVE: true,
+    CHUNK_SEQUENCE: true,
+  });
+  const [showInactive, setShowInactive] = useState(false);
+  const [nodeSearchQuery, setNodeSearchQuery] = useState("");
+  const [highlightedNodes, setHighlightedNodes] = useState(new Set());
 
   // Initialize: Try loading from backend first, fall back to sample data if backend unavailable
   useEffect(() => {
@@ -742,6 +754,50 @@ const MemoryPlatform = () => {
     );
   };
 
+  // Filter graph data based on current filters
+  const filteredGraphData = useMemo(() => {
+    let filteredNodes = graphData.nodes.filter(node => {
+      // Filter by active/inactive
+      if (!showInactive && !node.is_active) return false;
+      
+      // Filter by search query
+      if (nodeSearchQuery.trim()) {
+        const query = nodeSearchQuery.toLowerCase();
+        const contentMatch = node.content?.toLowerCase().includes(query);
+        const idMatch = node.id?.toLowerCase().includes(query);
+        if (!contentMatch && !idMatch) return false;
+      }
+      
+      return true;
+    });
+
+    // Filter edges based on relation types and node visibility
+    const visibleNodeIds = new Set(filteredNodes.map(n => n.id));
+    const filteredEdges = graphData.edges.filter(edge => {
+      // Check if relation type is enabled
+      if (!filteredRelationTypes[edge.relation_type]) return false;
+      
+      // Check if both nodes are visible
+      if (!visibleNodeIds.has(edge.from_id) || !visibleNodeIds.has(edge.to_id)) {
+        return false;
+      }
+      
+      return true;
+    });
+
+    return { nodes: filteredNodes, edges: filteredEdges };
+  }, [graphData, filteredRelationTypes, showInactive, nodeSearchQuery]);
+
+  // Get connected node IDs for highlighting
+  const getConnectedNodeIds = useCallback((nodeId) => {
+    const connected = new Set([nodeId]);
+    filteredGraphData.edges.forEach(edge => {
+      if (edge.from_id === nodeId) connected.add(edge.to_id);
+      if (edge.to_id === nodeId) connected.add(edge.from_id);
+    });
+    return connected;
+  }, [filteredGraphData.edges]);
+
   // Graph Visualization Component
   // NOTE: Current implementation uses custom SVG+React for small-medium graphs.
   // For advanced graphs (100+ nodes, complex interactions), consider migrating to:
@@ -765,10 +821,10 @@ const MemoryPlatform = () => {
         return;
       }
 
-      const nodeCount = graphData.nodes.length;
+      const nodeCount = filteredGraphData.nodes.length;
 
       // Create node IDs string for comparison
-      const nodeIds = graphData.nodes
+      const nodeIds = filteredGraphData.nodes
         .map((n) => n.id)
         .sort()
         .join(",");
@@ -797,7 +853,7 @@ const MemoryPlatform = () => {
       const centerY = height / 2;
 
       // Circular layout algorithm with adaptive radius
-      const positions = graphData.nodes.map((node, i) => {
+      const positions = filteredGraphData.nodes.map((node, i) => {
         const angle = (i / nodeCount) * 2 * Math.PI;
         const radius = Math.min(200, Math.max(100, nodeCount * 5)); // Adaptive radius based on node count
         return {
@@ -816,7 +872,7 @@ const MemoryPlatform = () => {
       }, 0);
       // Only trigger when node count changes - the ref check inside prevents unnecessary updates
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [graphData.nodes.length]);
+    }, [filteredGraphData.nodes.length]);
 
     const handleMouseDown = (e) => {
       setIsDragging(true);
@@ -836,15 +892,127 @@ const MemoryPlatform = () => {
       setIsDragging(false);
     };
 
-    // Memoize handleWheel to prevent unnecessary re-attachments
+    // Enhanced mouse wheel zoom that zooms towards cursor position
     const handleWheel = useCallback((e) => {
       e.preventDefault();
-      const delta = e.deltaY * -0.001;
-      setTransform((prev) => {
-        const newScale = Math.min(Math.max(0.5, prev.scale + delta), 3);
-        return { ...prev, scale: newScale };
+      
+      const svgElement = svgRef.current;
+      if (!svgElement) return;
+      
+      const rect = svgElement.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+      
+      // Calculate zoom factor
+      const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+      const newScale = Math.min(Math.max(0.5, transform.scale * zoomFactor), 3);
+      
+      // Calculate the point in SVG coordinates before zoom
+      const svgX = (mouseX - transform.x) / transform.scale;
+      const svgY = (mouseY - transform.y) / transform.scale;
+      
+      // Adjust translation to zoom towards cursor
+      const newX = mouseX - svgX * newScale;
+      const newY = mouseY - svgY * newScale;
+      
+      setTransform({
+        x: newX,
+        y: newY,
+        scale: newScale
       });
-    }, []);
+    }, [transform]);
+
+    const handleZoomIn = () => {
+      const svgElement = svgRef.current;
+      if (!svgElement) {
+        setTransform(prev => ({
+          ...prev,
+          scale: Math.min(prev.scale * 1.2, 3)
+        }));
+        return;
+      }
+      
+      // Zoom towards center of viewport
+      const rect = svgElement.getBoundingClientRect();
+      const centerX = rect.width / 2;
+      const centerY = rect.height / 2;
+      
+      const zoomFactor = 1.2;
+      const newScale = Math.min(transform.scale * zoomFactor, 3);
+      
+      const svgX = (centerX - transform.x) / transform.scale;
+      const svgY = (centerY - transform.y) / transform.scale;
+      
+      setTransform({
+        x: centerX - svgX * newScale,
+        y: centerY - svgY * newScale,
+        scale: newScale
+      });
+    };
+
+    const handleZoomOut = () => {
+      const svgElement = svgRef.current;
+      if (!svgElement) {
+        setTransform(prev => ({
+          ...prev,
+          scale: Math.max(prev.scale / 1.2, 0.5)
+        }));
+        return;
+      }
+      
+      // Zoom towards center of viewport
+      const rect = svgElement.getBoundingClientRect();
+      const centerX = rect.width / 2;
+      const centerY = rect.height / 2;
+      
+      const zoomFactor = 0.833; // 1/1.2
+      const newScale = Math.max(transform.scale * zoomFactor, 0.5);
+      
+      const svgX = (centerX - transform.x) / transform.scale;
+      const svgY = (centerY - transform.y) / transform.scale;
+      
+      setTransform({
+        x: centerX - svgX * newScale,
+        y: centerY - svgY * newScale,
+        scale: newScale
+      });
+    };
+
+    const handleResetView = () => {
+      setTransform({ x: 0, y: 0, scale: 1 });
+      setHoveredNode(null);
+      setHighlightedNodes(new Set());
+    };
+
+    // Keyboard shortcuts for zoom
+    useEffect(() => {
+      const handleKeyDown = (e) => {
+        // Only handle if not typing in an input field
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+          return;
+        }
+
+        // Ctrl/Cmd + Plus or Equals for zoom in
+        if ((e.ctrlKey || e.metaKey) && (e.key === '=' || e.key === '+')) {
+          e.preventDefault();
+          handleZoomIn();
+        }
+        // Ctrl/Cmd + Minus for zoom out
+        if ((e.ctrlKey || e.metaKey) && e.key === '-') {
+          e.preventDefault();
+          handleZoomOut();
+        }
+        // Ctrl/Cmd + 0 for reset
+        if ((e.ctrlKey || e.metaKey) && e.key === '0') {
+          e.preventDefault();
+          handleResetView();
+        }
+      };
+
+      window.addEventListener('keydown', handleKeyDown);
+      return () => window.removeEventListener('keydown', handleKeyDown);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [transform.scale]);
 
     // Attach wheel event listener manually with passive: false to allow preventDefault
     useEffect(() => {
@@ -867,6 +1035,96 @@ const MemoryPlatform = () => {
 
     return (
       <div className="relative w-full h-full bg-slate-900 rounded-lg overflow-hidden">
+        {/* Controls Panel */}
+        <div className="absolute top-4 left-4 z-10 bg-slate-800/95 border border-slate-700 rounded-lg p-3 space-y-3 min-w-[200px]">
+          {/* Search */}
+          <div>
+            <input
+              type="text"
+              placeholder="Search nodes..."
+              value={nodeSearchQuery}
+              onChange={(e) => setNodeSearchQuery(e.target.value)}
+              className="w-full px-2 py-1.5 bg-slate-900 border border-slate-700 rounded text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
+            />
+          </div>
+
+          {/* Relationship Type Filters */}
+          <div>
+            <p className="text-xs text-gray-400 mb-2">Relationship Types:</p>
+            <div className="space-y-1.5">
+              {Object.entries(filteredRelationTypes).map(([type, enabled]) => (
+                <label key={type} className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={enabled}
+                    onChange={(e) => setFilteredRelationTypes(prev => ({
+                      ...prev,
+                      [type]: e.target.checked
+                    }))}
+                    className="w-3 h-3 rounded"
+                  />
+                  <span className="text-xs text-gray-300">{type}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {/* Active/Inactive Filter */}
+          <div>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={showInactive}
+                onChange={(e) => setShowInactive(e.target.checked)}
+                className="w-3 h-3 rounded"
+              />
+              <span className="text-xs text-gray-300">Show Inactive</span>
+            </label>
+          </div>
+
+          {/* Zoom Controls */}
+          <div className="pt-2 border-t border-slate-700">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-xs text-gray-400">Zoom:</p>
+              <span className="text-xs text-gray-300 font-mono">
+                {Math.round(transform.scale * 100)}%
+              </span>
+            </div>
+            <div className="flex gap-2 mb-2">
+              <button
+                onClick={handleZoomOut}
+                className="flex-1 px-3 py-1.5 bg-slate-700 hover:bg-slate-600 active:bg-slate-500 rounded text-sm text-white font-bold transition-colors"
+                title="Zoom Out (Ctrl/Cmd + -)"
+              >
+                −
+              </button>
+              <button
+                onClick={handleZoomIn}
+                className="flex-1 px-3 py-1.5 bg-slate-700 hover:bg-slate-600 active:bg-slate-500 rounded text-sm text-white font-bold transition-colors"
+                title="Zoom In (Ctrl/Cmd + +)"
+              >
+                +
+              </button>
+            </div>
+            <button
+              onClick={handleResetView}
+              className="w-full px-2 py-1.5 bg-blue-700 hover:bg-blue-600 active:bg-blue-500 rounded text-xs text-white transition-colors"
+              title="Reset View (Ctrl/Cmd + 0)"
+            >
+              Reset View
+            </button>
+            <p className="text-[10px] text-gray-500 mt-2">
+              Scroll to zoom • Drag to pan
+            </p>
+          </div>
+
+          {/* Stats */}
+          <div className="pt-2 border-t border-slate-700 text-xs text-gray-400">
+            <p>Nodes: {filteredGraphData.nodes.length}</p>
+            <p>Edges: {filteredGraphData.edges.length}</p>
+          </div>
+        </div>
+
         <svg
           ref={svgRef}
           width="100%"
@@ -907,13 +1165,23 @@ const MemoryPlatform = () => {
             >
               <polygon points="0 0, 10 3, 0 6" fill="#8b5cf6" />
             </marker>
+            <marker
+              id="arrowhead-chunk"
+              markerWidth="10"
+              markerHeight="10"
+              refX="9"
+              refY="3"
+              orient="auto"
+            >
+              <polygon points="0 0, 10 3, 0 6" fill="#10b981" />
+            </marker>
           </defs>
 
           <g
             transform={`translate(${transform.x}, ${transform.y}) scale(${transform.scale})`}
           >
             {/* Edges */}
-            {graphData.edges.map((edge, i) => {
+            {filteredGraphData.edges.map((edge, i) => {
               const fromNode = graphInstance.find((n) => n.id === edge.from_id);
               const toNode = graphInstance.find((n) => n.id === edge.to_id);
               if (!fromNode || !toNode) return null;
@@ -922,13 +1190,21 @@ const MemoryPlatform = () => {
                 UPDATE: "arrowhead-update",
                 EXTEND: "arrowhead-extend",
                 DERIVE: "arrowhead-derive",
+                CHUNK_SEQUENCE: "arrowhead-chunk",
               };
 
               const colorMap = {
                 UPDATE: "#ef4444",
                 EXTEND: "#3b82f6",
                 DERIVE: "#8b5cf6",
+                CHUNK_SEQUENCE: "#10b981",
               };
+
+              // Highlight edges connected to hovered/selected node
+              const isHighlighted = hoveredNode && 
+                (edge.from_id === hoveredNode.id || edge.to_id === hoveredNode.id);
+              const isConnectedToSelected = selectedNode && 
+                (edge.from_id === selectedNode.id || edge.to_id === selectedNode.id);
 
               return (
                 <g key={`edge-${i}`}>
@@ -937,20 +1213,23 @@ const MemoryPlatform = () => {
                     y1={fromNode.y}
                     x2={toNode.x}
                     y2={toNode.y}
-                    stroke={colorMap[edge.relation_type]}
-                    strokeWidth={2}
-                    markerEnd={`url(#${markerMap[edge.relation_type]})`}
-                    opacity={0.6}
+                    stroke={colorMap[edge.relation_type] || "#6b7280"}
+                    strokeWidth={isHighlighted || isConnectedToSelected ? 3 : 2}
+                    markerEnd={`url(#${markerMap[edge.relation_type] || "arrowhead-extend"})`}
+                    opacity={isHighlighted || isConnectedToSelected ? 1 : 0.6}
                   />
-                  <text
-                    x={(fromNode.x + toNode.x) / 2}
-                    y={(fromNode.y + toNode.y) / 2}
-                    fill="#94a3b8"
-                    fontSize="10"
-                    textAnchor="middle"
-                  >
-                    {edge.relation_type}
-                  </text>
+                  {(isHighlighted || isConnectedToSelected) && (
+                    <text
+                      x={(fromNode.x + toNode.x) / 2}
+                      y={(fromNode.y + toNode.y) / 2}
+                      fill="#e2e8f0"
+                      fontSize="11"
+                      textAnchor="middle"
+                      fontWeight="bold"
+                    >
+                      {edge.relation_type}
+                    </text>
+                  )}
                 </g>
               );
             })}
@@ -958,7 +1237,12 @@ const MemoryPlatform = () => {
             {/* Nodes */}
             {graphInstance.map((node) => {
               const isSelected = selectedNode?.id === node.id;
+              const isHovered = hoveredNode?.id === node.id;
+              const isHighlighted = highlightedNodes.has(node.id);
               const nodeColor = node.is_active ? "#10b981" : "#6b7280";
+              
+              // Determine if node should be highlighted (connected to hovered/selected)
+              const shouldHighlight = isSelected || isHovered || isHighlighted;
 
               return (
                 <g
@@ -966,28 +1250,68 @@ const MemoryPlatform = () => {
                   onClick={() => {
                     setSelectedNode(node);
                     loadNodeRelationships(node.id);
+                    const connected = getConnectedNodeIds(node.id);
+                    setHighlightedNodes(connected);
+                  }}
+                  onMouseEnter={() => {
+                    setHoveredNode(node);
+                    const connected = getConnectedNodeIds(node.id);
+                    setHighlightedNodes(connected);
+                  }}
+                  onMouseLeave={() => {
+                    setHoveredNode(null);
+                    if (!selectedNode || selectedNode.id !== node.id) {
+                      setHighlightedNodes(new Set());
+                    }
                   }}
                   style={{ cursor: "pointer" }}
                 >
                   <circle
                     cx={node.x}
                     cy={node.y}
-                    r={isSelected ? 25 : 20}
+                    r={isSelected ? 28 : isHovered ? 24 : 20}
                     fill={nodeColor}
-                    stroke={isSelected ? "#fbbf24" : "#1e293b"}
-                    strokeWidth={isSelected ? 3 : 2}
-                    opacity={node.is_active ? 1 : 0.5}
+                    stroke={isSelected ? "#fbbf24" : isHovered ? "#60a5fa" : "#1e293b"}
+                    strokeWidth={isSelected ? 4 : isHovered ? 3 : 2}
+                    opacity={shouldHighlight ? 1 : node.is_active ? 0.8 : 0.4}
+                    className="transition-all duration-200"
                   />
+                  {/* Node label */}
                   <text
                     x={node.x}
                     y={node.y + 35}
-                    fill="#e2e8f0"
-                    fontSize="11"
+                    fill={shouldHighlight ? "#fbbf24" : "#e2e8f0"}
+                    fontSize={isSelected || isHovered ? "12" : "11"}
                     textAnchor="middle"
-                    fontWeight={isSelected ? "bold" : "normal"}
+                    fontWeight={isSelected || isHovered ? "bold" : "normal"}
                   >
                     v{node.version}
                   </text>
+                  {/* Content preview on hover */}
+                  {isHovered && (
+                    <g>
+                      <rect
+                        x={node.x - 100}
+                        y={node.y - 50}
+                        width="200"
+                        height="30"
+                        fill="#1e293b"
+                        stroke="#3b82f6"
+                        strokeWidth="1"
+                        rx="4"
+                        opacity="0.95"
+                      />
+                      <text
+                        x={node.x}
+                        y={node.y - 30}
+                        fill="#e2e8f0"
+                        fontSize="10"
+                        textAnchor="middle"
+                      >
+                        {node.content?.substring(0, 40) || node.id.substring(0, 8)}...
+                      </text>
+                    </g>
+                  )}
                 </g>
               );
             })}
@@ -995,7 +1319,7 @@ const MemoryPlatform = () => {
         </svg>
 
         {/* Legend */}
-        <div className="absolute bottom-4 left-4 bg-slate-800 p-3 rounded-lg text-xs space-y-2">
+        <div className="absolute bottom-4 right-4 bg-slate-800/95 border border-slate-700 p-3 rounded-lg text-xs space-y-2 z-10">
           <div className="flex items-center gap-2">
             <div className="w-3 h-3 rounded-full bg-green-500"></div>
             <span className="text-gray-300">Active Memory</span>
